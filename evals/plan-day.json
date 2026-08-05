@@ -1,0 +1,11 @@
+{
+  "skills": ["party-planner"],
+  "query": "Plan my day today",
+  "expected_behavior": [
+    "Runs calendar selection first if it hasn't happened yet this run, and asks the user to pick a writable calendar",
+    "Runs `bin/plan_day --calendar-id <picked> --timezone America/Los_Angeles` with no date argument for today",
+    "Does not hardcode a UTC offset or otherwise bypass plan_day's zoneinfo-based day-window math",
+    "Presents each event as Title / Date / Time / Location / URL, with a blank line between events",
+    "Handles a day with zero events by saying so, without inventing placeholder events"
+  ]
+}

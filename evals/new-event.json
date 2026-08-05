@@ -1,0 +1,14 @@
+{
+  "skills": ["party-planner"],
+  "query": "Add this to my calendar: https://lu.ma/example-event",
+  "expected_behavior": [
+    "Lists writable calendars via `gws calendar calendarList list` and asks the user to pick one before touching the calendar in any way",
+    "Runs `bin/check_dup` on the raw pasted URL before fetching anything",
+    "On exit 0, runs `bin/fetch_event --json --default-tz America/Los_Angeles` and reads the normalized event JSON",
+    "Runs `bin/build_payload` with --fallback-location \"San Francisco, CA\" and --default-tz America/Los_Angeles always passed explicitly; never hand-computes a timezone offset or hand-assembles the description",
+    "If the fetched description is long or rambling, condenses it to 2-3 sentences and passes it via --description rather than letting create_event reshape anything",
+    "Shows the finalized title, date/time, location, and URL, and asks for explicit approval before writing",
+    "Only calls `bin/create_event` after the user says yes",
+    "Reports the created event's title, date/time, location, URL, and htmlLink"
+  ]
+}

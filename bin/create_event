@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Create a calendar event from a build_payload body. The human-gated write:
+run it only after the user has approved the event.
+
+  build_payload < event.json | create_event --calendar-id primary
+  create_event --calendar-id primary --input payload.json
+  create_event --calendar-id primary --dry-run < payload.json      # validate, do not write
+
+Reads the insert body (build_payload output) on stdin or --input FILE, inserts
+it via `gws calendar events insert`, and prints a compact confirmation JSON
+(id, summary, start, location, htmlLink).
+
+Exit codes:
+  0  created (or validated with --dry-run)
+  2  error (bad usage, gws failure, unparseable response)
+
+  1 is not used by this script. argparse itself exits 2 on bad usage, and an
+  unhandled exception exits 1 -- so a bare 1 means the script crashed, not
+  that it returned a deliberate result. Leaving 1 unclaimed keeps that
+  distinction meaningful.
+
+Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
+"""
+import argparse
+import json
+import subprocess
+import sys
+
+
+def die(msg):
+    print(json.dumps({"error": msg}), file=sys.stdout)
+    sys.exit(2)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="create_event",
+        description="Insert a build_payload body into the calendar (gated write).",
+    )
+    ap.add_argument("--input", metavar="FILE",
+                    help="read the insert body from FILE instead of stdin")
+    ap.add_argument("--calendar-id", required=True,
+                    help="target calendar (required, e.g. from `gws calendar calendarList list`)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="validate the request without writing")
+    args = ap.parse_args()
+
+    try:
+        raw = open(args.input, encoding="utf-8").read() if args.input else sys.stdin.read()
+    except OSError as err:
+        die("could not read input: %s" % err)
+    if not raw.strip():
+        die("no input (expected a build_payload body on stdin)")
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError as err:
+        die("input is not valid JSON: %s" % err)
+    if not isinstance(body, dict) or not body.get("summary") or not body.get("start"):
+        die("input does not look like an insert body (need summary + start)")
+
+    cmd = ["gws", "calendar", "events", "insert",
+           "--params", json.dumps({"calendarId": args.calendar_id}),
+           "--json", json.dumps(body, ensure_ascii=False)]
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("`gws` not found on PATH")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        die("gws insert failed (exit %d): %s" % (proc.returncode, detail[:500]))
+
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "validated": True,
+                          "summary": body.get("summary")}, ensure_ascii=False, indent=2))
+        return
+
+    # gws prints a keyring notice to stderr; stdout is the created event JSON.
+    out = proc.stdout
+    brace = out.find("{")
+    try:
+        created = json.JSONDecoder().raw_decode(out, brace)[0] if brace != -1 else {}
+    except json.JSONDecodeError:
+        created = {}
+    when = created.get("start") or {}
+    print(json.dumps({
+        "created": True,
+        "id": created.get("id"),
+        "summary": created.get("summary") or body.get("summary"),
+        "start": when.get("dateTime") or when.get("date"),
+        "location": created.get("location") or body.get("location"),
+        "htmlLink": created.get("htmlLink"),
+    }, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+{
+  "skills": ["party-planner"],
+  "query": "Add this to my calendar: <URL of an event already on the target calendar>",
+  "expected_behavior": [
+    "Runs `bin/check_dup` on the raw pasted URL before fetching or building anything",
+    "On exit 3, does not call bin/fetch_event, bin/build_payload, or bin/create_event",
+    "Reports the existing event's title, start, location, matching URL, and htmlLink from check_dup's `matches`",
+    "States clearly that the event already exists and nothing was created",
+    "If exit 1 occurs instead, treats it as a crash to surface (like exit 2), not as a dup/no-dup verdict",
+    "If it suspects a same-event-different-URL duplicate check_dup couldn't catch (e.g. a Luma vs. Partiful copy), says so explicitly and asks before creating rather than deciding on its own"
+  ]
+}

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Turn a normalized event object (from a fetcher) into a Google Calendar
+insert body, applying the PARTYPLANNER rules as a single source of truth.
+
+  fetch_event <URL> --json | build_payload --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles
+  build_payload --input event.json --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles
+  build_payload --location "123 Main St" --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles < event.json
+
+Reads the normalized JSON on stdin (or --input FILE), writes the JSON body for
+`gws calendar events insert --json` to stdout.
+
+Rules encoded here (so the LLM never hand-assembles them):
+  * summary     = "<emoji> <title>"          (title whitespace-collapsed)
+  * description = "<url>\n\n<description>"    (URL is ALWAYS first, exact order;
+                                              body is --description if given,
+                                              else the fetched full text)
+  * location    = published address (if location_available), else --location,
+                  else a coarse published hint, else --fallback-location
+  * start       = event start (offset preserved)
+  * end         = event end, else start + <duration-hours>
+  * timeZone    = event IANA tz if valid, else --default-tz
+
+Requires: python3 (3.11+), stdlib only.
+"""
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# The PARTYPLANNER default title emoji. Callers override per condition
+# (e.g. \U0001f612 last-minute, \U0001f6a8 high priority) via --emoji.
+EMOJI_DEFAULT = "\U0001f921"  # 🤡
+
+# Locations the fetchers emit when the real address is gated/absent. These are
+# not usable as a calendar location, so they collapse to the fallback.
+SENTINELS = {
+    "unknown",
+    "register to see address",
+    "rsvp for full location",
+    "location not published",
+}
+
+
+def die(msg):
+    sys.exit("build_payload: " + msg)
+
+
+def resolve_tz(event, default_tz):
+    """Prefer an explicit IANA identifier, then a slash-bearing tz name, else
+    the default. Splashthat stores the IANA name in `timezone_identifier` and a
+    bare abbreviation ("PDT") in `timezone`, so identifier wins."""
+    for candidate in (event.get("timezone_identifier"), event.get("timezone")):
+        if isinstance(candidate, str) and candidate.strip():
+            try:
+                ZoneInfo(candidate.strip())
+                return candidate.strip()
+            except (ZoneInfoNotFoundError, ValueError):
+                continue
+    return default_tz
+
+
+def parse_start(raw, tz_name):
+    if not isinstance(raw, str) or not raw.strip():
+        die("event has no start time; cannot build an event body")
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        die("could not parse start time: %r" % raw)
+    if dt.tzinfo is None:  # fetchers emit offset-aware ISO, but be safe
+        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+    return dt
+
+
+def parse_end_override(raw, start, tz_name):
+    """Parse --end-date: a full ISO-ish local datetime ("2026-07-26T21:00",
+    "2026-07-26 21:00") or a bare time in the event's own tz ("9:00pm", "9 pm",
+    "21:00"), pinned to the start date and rolled to the next day if it lands at
+    or before the start (a past-midnight end)."""
+    raw = raw.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00").replace(" ", "T", 1))
+        return dt.astimezone(ZoneInfo(tz_name)) if dt.tzinfo else dt.replace(tzinfo=ZoneInfo(tz_name))
+    except ValueError:
+        pass
+    for fmt in ("%I:%M%p", "%I%p", "%H:%M", "%H:%M:%S"):
+        try:
+            t = datetime.strptime(raw.upper().replace(" ", ""), fmt).time()
+        except ValueError:
+            continue
+        end = datetime.combine(start.date(), t, tzinfo=ZoneInfo(tz_name))
+        return end + timedelta(days=1) if end <= start else end
+    die("could not parse --end-date: %r" % raw)
+
+
+def resolve_end(event, start, duration_hours, tz_name, override):
+    raw = event.get("end")
+    if isinstance(raw, str) and raw.strip():  # a published end always wins
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+            return dt
+        except ValueError:
+            die("could not parse end time: %r" % raw)
+    if override and override.strip():
+        return parse_end_override(override, start, tz_name)
+    return start + timedelta(hours=duration_hours)
+
+
+def resolve_location(event, provided, fallback):
+    """A published address wins whenever the fetch got a real one; --location and
+    the generic fallback are only used when it did not. `location_available` is
+    the fetcher's own signal that its `location` is a real street address rather
+    than a gated/coarse best-effort (e.g. Luma's obfuscated "Union Square, SF")."""
+    loc = (event.get("location") or "").strip()
+    available = event.get("location_available", True)
+    if loc and available and loc.lower() not in SENTINELS:
+        return loc
+    if provided and provided.strip():   # user-supplied fallback
+        return provided.strip()
+    if loc and loc.lower() not in SENTINELS:  # coarse, but better than "SF, CA"
+        return loc
+    return fallback
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="build_payload",
+        description="Normalized event JSON -> Google Calendar insert body.",
+    )
+    ap.add_argument("--input", metavar="FILE",
+                    help="read event JSON from FILE instead of stdin")
+    ap.add_argument("--location", metavar="STRING",
+                    help="fallback location, used only when the fetched address "
+                         "is gated/coarse (location_available false); a real "
+                         "published address always wins")
+    ap.add_argument("--fallback-location", metavar="STRING", required=True,
+                    help="location when none is published; see SKILL.md for "
+                         "the caller's default")
+    ap.add_argument("--emoji", default=EMOJI_DEFAULT,
+                    help="title prefix emoji; caller picks per condition, e.g. "
+                         "\U0001f612 last-minute, \U0001f6a8 high priority "
+                         "(default: %s)" % EMOJI_DEFAULT)
+    ap.add_argument("--description", metavar="STRING",
+                    help="use this description body instead of the fetched "
+                         "full text (e.g. an LLM-summarized version); the URL "
+                         "still leads the description")
+    ap.add_argument("--default-tz", metavar="IANA", required=True,
+                    help="timeZone when the event lacks a valid one; see "
+                         "SKILL.md for the caller's default")
+    ap.add_argument("--end-date", metavar="WHEN",
+                    help="fallback end when none is published: ISO-ish local "
+                         "datetime or a bare time in the event tz (\"9:00pm\", "
+                         "\"21:00\"). A published end always wins.")
+    ap.add_argument("--duration-hours", type=float, default=2.0,
+                    help="event length when no end time is published (default: %(default)s)")
+    args = ap.parse_args()
+
+    try:
+        raw = open(args.input, encoding="utf-8").read() if args.input else sys.stdin.read()
+    except OSError as err:
+        die("could not read input: %s" % err)
+    if not raw.strip():
+        die("no input (expected normalized event JSON on stdin)")
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError as err:
+        die("input is not valid JSON: %s" % err)
+    if not isinstance(event, dict):
+        die("input JSON must be an object")
+
+    url = (event.get("url") or "").strip()
+    if not url:
+        die("event has no url; the URL is required and must lead the description")
+
+    title = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
+    summary = "%s %s" % (args.emoji, title)
+
+    body_desc = args.description if args.description is not None else (event.get("description") or "")
+    body_desc = body_desc.strip()
+    description = url + ("\n\n" + body_desc if body_desc else "")
+
+    tz_name = resolve_tz(event, args.default_tz)
+    start = parse_start(event.get("start"), tz_name)
+    end = resolve_end(event, start, args.duration_hours, tz_name, args.end_date)
+    if end <= start:
+        die("end time is not after start time (start=%s end=%s)"
+            % (start.isoformat(), end.isoformat()))
+
+    payload = {
+        "summary": summary,
+        "description": description,
+        "location": resolve_location(event, args.location, args.fallback_location),
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+    }
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

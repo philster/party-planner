@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Daily agenda: list the day's events, sorted by start.
+
+  plan_day --calendar-id primary --timezone America/Los_Angeles                # today
+  plan_day --calendar-id primary --timezone America/Los_Angeles 2026-07-20    # a specific day
+  plan_day --calendar-id primary --timezone America/Los_Angeles --json
+
+`--timezone` is required (see SKILL.md for the caller's default). Computes the
+day window in that zone with zoneinfo (correct across a DST boundary -- never a
+hardcoded offset), queries the calendar, and prints each event as
+Title / Date / Time / Location / URL, blank-line separated.
+
+Exit codes:
+  0  ok (even with no events)
+  2  error (bad usage, gws failure, unparseable response)
+
+  1 is not used by this script. argparse itself exits 2 on bad usage, and an
+  unhandled exception exits 1 -- so a bare 1 means the script crashed, not
+  that it returned a deliberate result. Leaving 1 unclaimed keeps that
+  distinction meaningful.
+
+Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from eventfmt import clock  # noqa: E402
+
+HREF_RE = re.compile(r'href="(https?://[^"]+)"', re.I)
+URL_RE = re.compile(r'https?://\S+')
+
+
+def die(msg):
+    print(json.dumps({"error": msg}), file=sys.stdout)
+    sys.exit(2)
+
+
+def query(calendar_id, time_min, time_max, zone_name):
+    params = {
+        "calendarId": calendar_id,
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": True,
+        "orderBy": "startTime",
+        "timeZone": zone_name,
+        "maxResults": 250,
+    }
+    cmd = ["gws", "calendar", "events", "list", "--params", json.dumps(params)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("`gws` not found on PATH")
+    if proc.returncode != 0:
+        die("gws query failed (exit %d): %s"
+            % (proc.returncode, (proc.stderr or proc.stdout or "").strip()[:500]))
+    brace = proc.stdout.find("{")
+    if brace == -1:
+        die("gws returned no JSON object")
+    try:
+        return json.JSONDecoder().raw_decode(proc.stdout, brace)[0]
+    except json.JSONDecodeError as err:
+        die("could not parse gws response: %s" % err)
+
+
+def when(node, tz):
+    """(datetime_or_date, is_all_day) from an event start/end node."""
+    if not isinstance(node, dict):
+        return None, False
+    if node.get("dateTime"):
+        return datetime.fromisoformat(node["dateTime"]).astimezone(tz), False
+    if node.get("date"):
+        return datetime.fromisoformat(node["date"]).date(), True
+    return None, False
+
+
+def day_line(start):
+    return start.strftime("%A, %B ") + str(start.day)
+
+
+def time_line(start, end, all_day):
+    if all_day or start is None:
+        return "All day"
+    if end is None:
+        return clock(start)
+    if getattr(end, "date", None) and hasattr(start, "date") and end.date() != start.date():
+        return "%s - %s %s" % (clock(start), day_line(end), clock(end))
+    return "%s - %s" % (clock(start), clock(end))
+
+
+def url_of(description):
+    if not description:
+        return None
+    m = HREF_RE.search(description) or URL_RE.search(description)
+    return m.group(1) if m and m.lastindex else (m.group(0) if m else None)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="plan_day", description="Daily agenda.")
+    ap.add_argument("date", nargs="?", help="YYYY-MM-DD (default: today, in --timezone)")
+    ap.add_argument("--calendar-id", required=True,
+                    help="calendar to read (required, e.g. from `gws calendar calendarList list`)")
+    ap.add_argument("--timezone", required=True, metavar="IANA",
+                    help="IANA zone the day boundaries and times are computed "
+                         "in; see SKILL.md for the caller's default")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    args = ap.parse_args()
+
+    tz = ZoneInfo(args.timezone)
+    if args.date:
+        try:
+            d = datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError:
+            die("could not parse date %r (want YYYY-MM-DD)" % args.date)
+    else:
+        d = datetime.now(tz).date()
+
+    start = datetime(d.year, d.month, d.day, tzinfo=tz)
+    data = query(args.calendar_id, start.isoformat(), (start + timedelta(days=1)).isoformat(), args.timezone)
+    items = data.get("items") or []
+
+    events = []
+    for it in items:
+        s, all_day = when(it.get("start"), tz)
+        e, _ = when(it.get("end"), tz)
+        events.append({
+            "title": it.get("summary") or "(no title)",
+            "date": day_line(s) if s else None,
+            "start": s.isoformat() if hasattr(s, "isoformat") else None,
+            "time": time_line(s, e, all_day),
+            "location": it.get("location") or "(no location)",
+            "url": url_of(it.get("description")) or "(no url)",
+            "_sortkey": (s if isinstance(s, datetime) else datetime(d.year, d.month, d.day, tzinfo=tz)),
+        })
+    events.sort(key=lambda ev: ev["_sortkey"])
+
+    if args.json:
+        for ev in events:
+            ev.pop("_sortkey", None)
+        print(json.dumps({"date": d.isoformat(), "count": len(events), "events": events},
+                         ensure_ascii=False, indent=2))
+        return
+
+    header = d.strftime("%A, %B ") + str(d.day) + ", " + str(d.year)
+    if not events:
+        print("%s\n\nNo events." % header)
+        return
+    blocks = []
+    for ev in events:
+        blocks.append("\n".join([
+            ev["title"],
+            day_line(ev["_sortkey"]),
+            ev["time"],
+            ev["location"],
+            ev["url"],
+        ]))
+    print(header + "\n\n" + "\n\n".join(blocks))
+
+
+if __name__ == "__main__":
+    main()

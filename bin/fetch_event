@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Fetch and normalize an event from its URL.
+
+  fetch_event https://luma.com/3a3qsbxo --default-tz America/Los_Angeles
+  fetch_event https://partiful.com/e/abc --json --default-tz America/Los_Angeles
+
+Cleans the URL, detects the platform by host, dispatches to the matching
+extractor, and prints one normalized event. Unknown hosts fall back to a generic
+schema.org / OpenGraph reader; if even that finds nothing, exit 4 signals the
+caller to use the agent's web retrieval tool and hand-build the same JSON shape.
+`--default-tz` is required and only affects the generic reader (registered
+platforms carry their own zone info); see SKILL.md for the caller's default.
+
+Exit codes:
+  0  event extracted
+  2  usage error, or a known platform failed to parse
+  4  unsupported page -> use the agent's web retrieval tool
+
+Requires: python3 (3.11+), curl; curl_cffi only for Splashthat.
+"""
+import argparse
+import json
+import os
+import sys
+from urllib.parse import urlsplit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from clean_url import clean_url                     # noqa: E402
+from extractors import extractor_for_host, extract_generic  # noqa: E402
+from httpfetch import FetchError                    # noqa: E402
+
+FALLBACK = 4
+
+
+def emit(event, as_json):
+    if as_json:
+        json.dump(event, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return
+    print("platform    : " + str(event.get("platform")))
+    print("title       : " + str(event.get("title")))
+    print("date/time   : %s (%s)" % (event.get("datetime_display"), event.get("timezone")))
+    print("location    : " + str(event.get("location")))
+    print("event-id    : " + str(event.get("event_id")))
+    print("url         : " + str(event.get("url")))
+    print("description :")
+    print(event.get("description") or "(none)")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="fetch_event",
+        description="URL -> normalized event JSON (feeds build_payload).",
+    )
+    ap.add_argument("url", help="event URL")
+    ap.add_argument("--json", action="store_true", help="emit JSON (default: text)")
+    ap.add_argument("--default-tz", metavar="IANA", required=True,
+                    help="IANA zone used by the generic (unregistered-platform) "
+                         "extractor to render offset-but-no-zone timestamps; "
+                         "see the default-timezone setting in SKILL.md")
+    args = ap.parse_args()
+
+    url = clean_url(args.url.strip())
+    host = (urlsplit(url).hostname or "").lower()
+
+    match = extractor_for_host(host)
+    if match:
+        name, fn = match
+        try:
+            emit(fn(url), args.json)
+        except FetchError as err:
+            print("fetch_event: %s extraction failed: %s" % (name, err),
+                  file=sys.stderr)
+            sys.exit(2)
+        return
+
+    # Unknown host: best-effort generic reader, else defer to the agent.
+    try:
+        event = extract_generic(url, args.default_tz)
+    except FetchError as err:
+        print("fetch_event: unsupported host %r and generic read failed: %s\n"
+              "  -> use web retrieval and build the normalized JSON by hand."
+              % (host, err), file=sys.stderr)
+        sys.exit(FALLBACK)
+    if event is None:
+        print("fetch_event: unsupported host %r (no schema.org/OpenGraph event)\n"
+              "  -> use web retrieval and build the normalized JSON by hand."
+              % host, file=sys.stderr)
+        sys.exit(FALLBACK)
+    emit(event, args.json)
+
+
+if __name__ == "__main__":
+    main()

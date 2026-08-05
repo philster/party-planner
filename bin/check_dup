@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Check calendar for an event that already links to a given URL.
+
+  check_dup --calendar-id primary https://lu.ma/3a3qsbxo
+  check_dup --url https://partiful.com/e/abc --calendar-id primary
+
+The input URL is cleaned (tracking params stripped) first, so this can run
+before fetch on a raw pasted URL. Queries the calendar with the URL as a
+full-text search, then confirms each hit
+by matching the (normalized) URL inside the event's stored description -- the
+`q` search tokenizes loosely, so a server-side hit alone is not proof. Because
+PARTYPLANNER always writes the URL first in the description, a real duplicate
+always contains it verbatim. Matching is a plain substring check on the stored
+description, so it does not depend on any timezone -- no --timezone flag here.
+
+Output: a JSON report on stdout, always.
+Exit codes (so `check_dup <url> && create_event ...` reads naturally):
+  0  no duplicate  -> safe to create
+  2  error (bad usage, gws failure, unparseable response)
+  3  duplicate found
+
+  1 is not used by this script. argparse itself exits 2 on bad usage, and an
+  unhandled exception exits 1 -- so a bare 1 means the script crashed, not
+  that it returned a deliberate result. Leaving 1 unclaimed keeps that
+  distinction meaningful.
+
+Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from clean_url import clean_url  # noqa: E402
+
+NO_DUP, DUP_FOUND, ERROR = 0, 3, 2
+
+
+def die(msg):
+    print(json.dumps({"error": msg}), file=sys.stdout)
+    sys.exit(ERROR)
+
+
+def normalize(url):
+    """Collapse the cosmetic differences between two spellings of the same URL:
+    scheme, a leading www., case, and a trailing slash."""
+    u = (url or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if u.startswith(prefix):
+            u = u[len(prefix):]
+            break
+    if u.startswith("www."):
+        u = u[4:]
+    return u.rstrip("/")
+
+
+def run_query(calendar_id, url, max_results):
+    params = {
+        "calendarId": calendar_id,
+        "q": url,
+        "maxResults": max_results,
+        "singleEvents": True,
+    }
+    cmd = ["gws", "calendar", "events", "list", "--params", json.dumps(params)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("`gws` not found on PATH")
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        die("gws query failed (exit %d): %s" % (proc.returncode, detail[:500]))
+
+    # gws prints a keyring notice to stderr; stdout is the raw Calendar API JSON.
+    # Decode from the first brace to tolerate any incidental prefix.
+    out = proc.stdout
+    brace = out.find("{")
+    if brace == -1:
+        die("gws returned no JSON object")
+    try:
+        return json.JSONDecoder().raw_decode(out, brace)[0]
+    except json.JSONDecodeError as err:
+        die("could not parse gws response: %s" % err)
+
+
+def summarize(item):
+    when = item.get("start") or {}
+    return {
+        "id": item.get("id"),
+        "summary": item.get("summary"),
+        "start": when.get("dateTime") or when.get("date"),
+        "location": item.get("location"),
+        "htmlLink": item.get("htmlLink"),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="check_dup",
+        description="Detect a calendar event already linking to a URL.",
+    )
+    ap.add_argument("url", nargs="?", help="event URL to check (clean/canonical)")
+    ap.add_argument("--url", dest="url_opt", help="event URL (alternative to positional)")
+    ap.add_argument("--calendar-id", required=True,
+                    help="calendar to search (required, e.g. from `gws calendar calendarList list`)")
+    ap.add_argument("--max-results", type=int, default=25,
+                    help="max events to examine (default: %(default)s)")
+    args = ap.parse_args()
+
+    raw = args.url or args.url_opt
+    if not raw or not raw.strip():
+        die("no URL given (pass it positionally or with --url)")
+    # Clean first so dedup can run before fetch, on a possibly-dirty pasted URL.
+    url = clean_url(raw.strip())
+
+    data = run_query(args.calendar_id, url, args.max_results)
+    items = data.get("items") or []
+
+    target = normalize(url)
+    matches = [summarize(it) for it in items
+               if target and target in normalize(it.get("description") or "")]
+
+    report = {
+        "query_url": url,
+        "duplicate": bool(matches),
+        "count": len(matches),
+        "matches": matches,
+    }
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    sys.exit(DUP_FOUND if matches else NO_DUP)
+
+
+if __name__ == "__main__":
+    main()
