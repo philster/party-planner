@@ -124,9 +124,10 @@ Ask again at the start of each new run — the choice is not persisted.
    When no summary/override is needed, the straight pipe is fine:
    ```
    bin/fetch_event <URL> --json --default-tz America/Los_Angeles \
-     | bin/build_payload --emoji 🤡 --fallback-location "San Francisco, CA" \
+     | bin/build_payload --fallback-location "San Francisco, CA" \
        --default-tz America/Los_Angeles > "$TMPDIR/partyplanner-payload.json"
    ```
+   (add `--emoji 🤡/😒/🚨` per the Emoji section's conditions)
 4. **Confirm.** Show the payload (title, date/time, location, URL) and **ask
    permission**. Do not write without an explicit yes.
 5. **Create.** On yes: `bin/create_event --calendar-id <picked> < "$TMPDIR/partyplanner-payload.json"`.
@@ -139,14 +140,14 @@ Ask again at the start of each new run — the choice is not persisted.
 
 ## Emoji (title prefix)
 
-The caller picks the emoji per event; `build_payload` defaults to 🤡 when none
-is given. Choose by condition, e.g.:
+`--emoji` is optional; omitted, the summary is plain `"<title>"`. Choose by
+condition — these three are the only options, never invent another one:
 
-- 🤡 — default / no special flag
+- 🤡 — ordinary event, no special flag
 - 😒 — last-minute or low-signal info
 - 🚨 — high priority / don't-miss
 
-Pass the choice as `--emoji`. `build_payload` always prefixes `"<emoji> <title>"`.
+No match on any of the three → omit `--emoji`.
 
 ## Duplicate notice output
 

@@ -10,7 +10,8 @@ Reads the normalized JSON on stdin (or --input FILE), writes the JSON body for
 `gws calendar events insert --json` to stdout.
 
 Rules encoded here (so the LLM never hand-assembles them):
-  * summary     = "<emoji> <title>"          (title whitespace-collapsed)
+  * summary     = "<emoji> <title>" if --emoji given, else "<title>"
+                                              (title whitespace-collapsed)
   * description = "<url>\n\n<description>"    (URL is ALWAYS first, exact order;
                                               body is --description if given,
                                               else the fetched full text)
@@ -28,10 +29,6 @@ import re
 import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-# The PARTYPLANNER default title emoji. Callers override per condition
-# (e.g. \U0001f612 last-minute, \U0001f6a8 high priority) via --emoji.
-EMOJI_DEFAULT = "\U0001f921"  # 🤡
 
 # Locations the fetchers emit when the real address is gated/absent. These are
 # not usable as a calendar location, so they collapse to the fallback.
@@ -139,10 +136,10 @@ def main():
     ap.add_argument("--fallback-location", metavar="STRING", required=True,
                     help="location when none is published; see SKILL.md for "
                          "the caller's default")
-    ap.add_argument("--emoji", default=EMOJI_DEFAULT,
+    ap.add_argument("--emoji",
                     help="title prefix emoji; caller picks per condition, e.g. "
-                         "\U0001f612 last-minute, \U0001f6a8 high priority "
-                         "(default: %s)" % EMOJI_DEFAULT)
+                         "\U0001f921 default, \U0001f612 last-minute, "
+                         "\U0001f6a8 high priority (omit for no prefix)")
     ap.add_argument("--description", metavar="STRING",
                     help="use this description body instead of the fetched "
                          "full text (e.g. an LLM-summarized version); the URL "
@@ -176,7 +173,7 @@ def main():
         die("event has no url; the URL is required and must lead the description")
 
     title = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
-    summary = "%s %s" % (args.emoji, title)
+    summary = "%s %s" % (args.emoji, title) if args.emoji else title
 
     body_desc = args.description if args.description is not None else (event.get("description") or "")
     body_desc = body_desc.strip()

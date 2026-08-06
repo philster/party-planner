@@ -101,7 +101,8 @@ Ask again at the start of each new run — the choice is not persisted.
    `--fallback-location "San Francisco, CA" --default-tz America/Los_Angeles`,
    plus flags for any judgment call:
 
-   - `--emoji <E>`: title prefix; default 🤡.
+   - `--emoji <E>`: title prefix; optional, no default — omitted, the summary
+     is the bare title (see [Emoji guidance](#emoji-guidance)).
    - `--description "<summary>"`: a concise 2–3 sentence summary after reading
      the fetched description. This is the only summarization point.
    - `--location "<address>"`: fallback when the published location is gated or
@@ -161,7 +162,9 @@ location, and URL, with a blank line between events. The script uses
 
 ## Emoji guidance
 
-- 🤡: default
+Only these three; never invent another. No match → omit `--emoji`.
+
+- 🤡: ordinary event, no special flag
 - 😒: last-minute or low-signal information
 - 🚨: high-priority or do-not-miss event
 
