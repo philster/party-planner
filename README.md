@@ -39,6 +39,17 @@ needed too, but only for Splashthat.
 
 ## Installing the skill
 
+### Ask the agent
+
+If you're chatting with an agent that can install skills for you, just ask it
+directly:
+
+```
+Install the /party-planner skill globally from https://github.com/philster/party-planner
+```
+
+### Manually
+
 Both sync scripts mirror `bin/` and `lib/` into the agent's skills directory
 (pruning anything you deleted from source) and mark the scripts executable.
 Run them from inside this directory.
