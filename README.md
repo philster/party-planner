@@ -78,8 +78,31 @@ DST=/path ./sync_codex.sh          # deploy somewhere else
 This installs `SKILL.md` and `AGENTS.md` as-is — Codex reads the latter for
 its own operating instructions.
 
+### OpenClaw
+
+```sh
+./sync_openclaw.sh              # sync to ~/.openclaw/workspace/skills/party-planner
+./sync_openclaw.sh --dry-run    # preview only, writes nothing
+DST=/path ./sync_openclaw.sh    # deploy somewhere else
+```
+
+This installs `SKILL.md`, with the in-project "BUILD STATUS" comment stripped
+out first, same as the Claude Code install.
+
+### Hermes Agent
+
+```sh
+./sync_hermes.sh                       # sync to ~/.hermes/skills/productivity/party-planner
+./sync_hermes.sh --dry-run             # preview only, writes nothing
+CATEGORY=calendar ./sync_hermes.sh     # install under a different category
+DST=/path ./sync_hermes.sh             # deploy somewhere else
+```
+
+Hermes nests skills under a category directory (`~/.hermes/skills/<category>/<name>`);
+`CATEGORY` defaults to `productivity`.
+
 Re-run the relevant script any time `bin/`, `lib/`, `SKILL.md`, or `AGENTS.md`
-changes. Both are safe to run repeatedly.
+changes. All four sync scripts are safe to run repeatedly.
 
 ## Layout
 

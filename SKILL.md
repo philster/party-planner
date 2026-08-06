@@ -1,6 +1,6 @@
 ---
 name: party-planner
-description: Adds an event to Google Calendar from a pasted URL (Luma, Partiful, Eventbrite, Splashthat, or any page with schema.org/OpenGraph event data), checking for an existing duplicate first; also prints a day's agenda. Use when the user pastes an event link and asks to add, save, or RSVP it to the calendar, asks whether an event is already on the calendar, or asks to plan today or another day.
+description: Adds a pasted event URL (Luma, Partiful, Eventbrite, Splashthat, or generic pages) to Google Calendar, checking duplicates first. Also prints a day's agenda.
 version: 1.0
 created: 2026-08-05
 allowed-tools:
