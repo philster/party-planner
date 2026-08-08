@@ -12,16 +12,42 @@ platform = one extract_* function + one REGISTRY row.
 import html as htmllib
 import json
 import re
-import urllib.request
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from clean_url import clean_url
 from eventfmt import UNKNOWN, resolve_zone, parse_iso, human, dedupe
-from httpfetch import UA, fetch, FetchError
+from httpfetch import fetch, FetchError
 
 NEXT_DATA_RE = re.compile(
     r"<script[^>]*\bid=\"__NEXT_DATA__\"[^>]*>(.*?)</script>", re.S)
+
+
+def _platform_url(candidate, fallback, host_pred):
+    """Keep an extractor-supplied URL only when it still belongs to the platform
+    that produced it.
+
+    Every "canonical" URL below is read out of the page: Splashthat's
+    `domain.effective`, Eventbrite's ld+json `url`, Partiful's `id`. Since that
+    URL leads the calendar description and is what `check_dup` matches on, a
+    page that sets it to `https://evil.example/` gets a phishing link filed
+    under a trustworthy title *and* a description that no future dedup will
+    recognize. Anything off-platform falls back to the cleaned pasted URL."""
+    if not isinstance(candidate, str) or not candidate.strip():
+        return fallback
+    try:
+        parts = urlsplit(candidate.strip())
+    except ValueError:
+        return fallback
+    if parts.scheme.lower() not in ("http", "https"):
+        return fallback
+    if not host_pred((parts.hostname or "").lower()):
+        return fallback
+    # Clean the accepted candidate too. It is page-supplied, so it can carry
+    # tracking params the pasted URL did not -- and check_dup searches for the
+    # cleaned spelling, so storing an uncleaned one would defeat dedup.
+    return clean_url(urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, "")))
 
 
 def _next_data(page):
@@ -56,8 +82,9 @@ def _prosemirror(node):
 
 
 def _luma_url(original):
-    """Cleaned URL with the host normalized to luma.com."""
-    return re.sub(r"^(https?://)(?:www\.)?lu\.ma/", r"\1luma.com/", clean_url(original))
+    """Cleaned URL. The lu.ma -> luma.com aliasing lives in clean_url now, so
+    check_dup arrives at the same string without knowing about Luma."""
+    return clean_url(original)
 
 
 def _luma_venue_join(geo, full):
@@ -141,11 +168,12 @@ def _ics_unescape(s):
 
 
 def _ics_location(cal_url):
+    """`calendarFile` comes out of the page's own JSON, so it goes through the
+    guarded fetcher like any other remote URL -- never a bare urlopen, which
+    would honour file:// and reach internal hosts."""
     try:
-        req = urllib.request.Request(cal_url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            text = resp.read().decode("utf-8", "replace")
-    except Exception:
+        text = fetch(cal_url, timeout=20)
+    except (FetchError, ValueError):
         return None
     text = re.sub(r"\r?\n[ \t]", "", text)  # RFC 5545 line unfolding
     hit = re.search(r"^LOCATION(?:;[^:\r\n]*)?:(.*)$", text, re.M)
@@ -186,9 +214,14 @@ def extract_partiful(url):
 
     description = re.sub(r"\n{3,}", "\n\n", (event.get("description") or "")).strip()
 
+    # The id becomes a path segment, so it has to look like one.
+    event_id = event.get("id") if isinstance(event.get("id"), str) else ""
+    canonical = ("https://partiful.com/e/" + event_id
+                 if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", event_id) else "")
+
     return {
         "platform": "partiful",
-        "url": "https://partiful.com/e/" + event["id"] if event.get("id") else clean_url(url),
+        "url": _platform_url(canonical, clean_url(url), _host_partiful),
         "title": re.sub(r"\s+", " ", (event.get("title") or UNKNOWN)).strip(),
         "start": start.isoformat() if start else None,
         "end": end.isoformat() if end else None,
@@ -347,7 +380,8 @@ def extract_eventbrite(url):
 
     return {
         "platform": "eventbrite",
-        "url": info.get("url") or (ld or {}).get("url") or clean_url(url),
+        "url": _platform_url(info.get("url") or (ld or {}).get("url"),
+                             clean_url(url), _host_eventbrite),
         "title": info.get("name") or (ld or {}).get("name") or UNKNOWN,
         "start": start.isoformat() if start else None,
         "end": end.isoformat() if end else None,
@@ -415,9 +449,10 @@ def extract_splashthat(url):
         address = "To be determined" if venue.get("tbd") else "Location not published"
 
     domain = (event.get("domain") or {}).get("effective", "")
+    canonical = "https://" + domain if isinstance(domain, str) and domain.strip() else ""
     return {
         "platform": "splashthat",
-        "url": ("https://" + domain) if domain else clean_url(url),
+        "url": _platform_url(canonical, clean_url(url), _host_splashthat),
         "title": re.sub(r"\s+", " ", str(event.get("title") or UNKNOWN)).strip(),
         "start": start.isoformat() if start else None,
         "end": end.isoformat() if end else None,
@@ -501,8 +536,11 @@ def extract_generic(url, default_tz):
         "location": address or _og(page, "og:street-address") or UNKNOWN,
         "location_available": bool(address),
         "event_id": UNKNOWN,
-        "description": (node.get("description")
-                       or _og(page, "og:description") or "").strip(),
+        # De-tagged like every other extractor: ld+json and og:description on an
+        # arbitrary page routinely carry raw HTML, and calendar clients render
+        # description markup.
+        "description": _detag(node.get("description")
+                              or _og(page, "og:description") or ""),
     }
 
 

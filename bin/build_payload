@@ -21,14 +21,28 @@ Rules encoded here (so the LLM never hand-assembles them):
   * end         = event end, else start + <duration-hours>
   * timeZone    = event IANA tz if valid, else --default-tz
 
+Remote-authored fields (title/description/location/url) are re-sanitized here,
+so a hand-built event object (the WebFetch fallback path) gets the same
+treatment as one that came from `fetch_event`.
+
+An approval token -- sha256 over the canonical payload -- goes to **stderr**,
+never into the payload file. `create_event` requires it, so the body the user
+approved is provably the body that gets written.
+
 Requires: python3 (3.11+), stdlib only.
 """
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from approval import token_for  # noqa: E402
+from clean_url import clean_url  # noqa: E402
+from untrusted import sanitize  # noqa: E402
 
 # Locations the fetchers emit when the real address is gated/absent. These are
 # not usable as a calendar location, so they collapse to the fallback.
@@ -168,9 +182,20 @@ def main():
     if not isinstance(event, dict):
         die("input JSON must be an object")
 
+    # Re-scrub here, not only in fetch_event: this is the last point before the
+    # text becomes a calendar entry, and a hand-built event (WebFetch fallback)
+    # never passed through fetch_event at all.
+    event = sanitize(event)
+
+    # Clean here as well as in the extractors: a hand-built event can carry a
+    # dirty URL, and this is the spelling that lands in the description. Since
+    # check_dup searches for the cleaned form, storing anything else would make
+    # a future duplicate check miss this event and file a second copy.
     url = (event.get("url") or "").strip()
     if not url:
-        die("event has no url; the URL is required and must lead the description")
+        die("event has no usable http(s) url; the URL is required and must lead "
+            "the description (a non-http scheme is rejected outright)")
+    url = clean_url(url)
 
     title = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
     summary = "%s %s" % (args.emoji, title) if args.emoji else title
@@ -195,6 +220,13 @@ def main():
     }
     json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
+
+    # stderr, so the token stays out of the payload file and reaches the agent
+    # (and therefore the user) over a channel an attacker on the filesystem
+    # cannot rewrite.
+    print("build_payload: approval-token %s" % token_for(payload), file=sys.stderr)
+    print("build_payload: show this payload to the user; on an explicit yes, pass "
+          "the token to create_event as --approve-token.", file=sys.stderr)
 
 
 if __name__ == "__main__":

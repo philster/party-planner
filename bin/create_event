@@ -2,17 +2,24 @@
 """Create a calendar event from a build_payload body. The human-gated write:
 run it only after the user has approved the event.
 
-  build_payload < event.json | create_event --calendar-id primary
-  create_event --calendar-id primary --input payload.json
+  create_event --calendar-id primary --approve-token sha256:… < payload.json
+  create_event --calendar-id primary --approve-token sha256:… --input payload.json
   create_event --calendar-id primary --dry-run < payload.json      # validate, do not write
 
 Reads the insert body (build_payload output) on stdin or --input FILE, inserts
 it via `gws calendar events insert`, and prints a compact confirmation JSON
 (id, summary, start, location, htmlLink).
 
+`--approve-token` is the mechanical half of the approval gate. build_payload
+prints the token for the body it produced; this script recomputes it over the
+body it actually reads and refuses to write on a mismatch. So a payload edited
+or swapped after the user said yes -- a race on a predictable temp filename, or
+an injected instruction to "just tweak one field" -- cannot reach the calendar
+under the old approval.
+
 Exit codes:
   0  created (or validated with --dry-run)
-  2  error (bad usage, gws failure, unparseable response)
+  2  error (bad usage, missing/mismatched approval token, gws failure)
 
   1 is not used by this script. argparse itself exits 2 on bad usage, and an
   unhandled exception exits 1 -- so a bare 1 means the script crashed, not
@@ -23,8 +30,12 @@ Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from approval import matches  # noqa: E402
 
 
 def die(msg):
@@ -41,8 +52,12 @@ def main():
                     help="read the insert body from FILE instead of stdin")
     ap.add_argument("--calendar-id", required=True,
                     help="target calendar (required, e.g. from `gws calendar calendarList list`)")
+    ap.add_argument("--approve-token", metavar="TOKEN",
+                    help="the approval token build_payload printed to stderr for "
+                         "this exact body; required for a real write, so the "
+                         "approved payload is provably the written one")
     ap.add_argument("--dry-run", action="store_true",
-                    help="validate the request without writing")
+                    help="validate the request without writing (no token needed)")
     args = ap.parse_args()
 
     try:
@@ -57,6 +72,19 @@ def main():
         die("input is not valid JSON: %s" % err)
     if not isinstance(body, dict) or not body.get("summary") or not body.get("start"):
         die("input does not look like an insert body (need summary + start)")
+
+    if not args.dry_run:
+        if not args.approve_token:
+            # Deliberately does not print the correct token: echoing it here
+            # would turn a missing-token error into an oracle, and any caller
+            # could mint approval for a body nobody looked at.
+            die("refusing to write without --approve-token: re-run build_payload "
+                "to get the token for this body, show the user the payload, and "
+                "pass the token once they approve it")
+        if not matches(args.approve_token, body):
+            die("approval token does not match this body -- it changed after it "
+                "was approved. Refusing to write. Re-run build_payload, show the "
+                "user the new payload, and get approval again.")
 
     cmd = ["gws", "calendar", "events", "insert",
            "--params", json.dumps({"calendarId": args.calendar_id}),

@@ -31,10 +31,11 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from clean_url import leading_url  # noqa: E402
 from eventfmt import clock  # noqa: E402
 
-HREF_RE = re.compile(r'href="(https?://[^"]+)"', re.I)
-URL_RE = re.compile(r'https?://\S+')
+TAG_RE = re.compile(r"<[^>]{0,400}>")
+URL_RE = re.compile(r"https?://\S+")
 
 
 def die(msg):
@@ -95,10 +96,20 @@ def time_line(start, end, all_day):
 
 
 def url_of(description):
+    """The event's URL, preferring the one the description leads with.
+
+    An `href` target is never preferred over visible text: the anchor label and
+    its destination can disagree, so honouring the href let anyone who can put
+    an event on the calendar have this line report a URL the description does
+    not actually show. Falls back to the first plain-text URL for events this
+    skill did not create."""
     if not description:
         return None
-    m = HREF_RE.search(description) or URL_RE.search(description)
-    return m.group(1) if m and m.lastindex else (m.group(0) if m else None)
+    lead = leading_url(description)
+    if lead:
+        return "https://" + lead
+    m = URL_RE.search(TAG_RE.sub(" ", description))
+    return m.group(0) if m else None
 
 
 def main():

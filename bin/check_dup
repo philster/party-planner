@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from clean_url import clean_url  # noqa: E402
+from clean_url import clean_url, leading_url, normalize_url  # noqa: E402
 
 NO_DUP, DUP_FOUND, ERROR = 0, 3, 2
 
@@ -43,26 +43,15 @@ def die(msg):
     sys.exit(ERROR)
 
 
-def normalize(url):
-    """Collapse the cosmetic differences between two spellings of the same URL:
-    scheme, a leading www., case, and a trailing slash."""
-    u = (url or "").strip().lower()
-    for prefix in ("https://", "http://"):
-        if u.startswith(prefix):
-            u = u[len(prefix):]
-            break
-    if u.startswith("www."):
-        u = u[4:]
-    return u.rstrip("/")
-
-
-def run_query(calendar_id, url, max_results):
+def run_page(calendar_id, url, max_results, page_token):
     params = {
         "calendarId": calendar_id,
         "q": url,
         "maxResults": max_results,
         "singleEvents": True,
     }
+    if page_token:
+        params["pageToken"] = page_token
     cmd = ["gws", "calendar", "events", "list", "--params", json.dumps(params)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -82,6 +71,22 @@ def run_query(calendar_id, url, max_results):
         return json.JSONDecoder().raw_decode(out, brace)[0]
     except json.JSONDecodeError as err:
         die("could not parse gws response: %s" % err)
+
+
+def run_query(calendar_id, url, max_results, max_pages):
+    """Walk every page of results rather than judging on the first.
+
+    `q` is a loose full-text search, so a busy calendar can push the real match
+    past a single page -- and a dedup check that stops early reports "new" for
+    an event that already exists. Returns (items, exhausted)."""
+    items, token = [], None
+    for _ in range(max_pages):
+        data = run_page(calendar_id, url, max_results, token)
+        items.extend(data.get("items") or [])
+        token = data.get("nextPageToken")
+        if not token:
+            return items, True
+    return items, False
 
 
 def summarize(item):
@@ -104,8 +109,10 @@ def main():
     ap.add_argument("--url", dest="url_opt", help="event URL (alternative to positional)")
     ap.add_argument("--calendar-id", required=True,
                     help="calendar to search (required, e.g. from `gws calendar calendarList list`)")
-    ap.add_argument("--max-results", type=int, default=25,
-                    help="max events to examine (default: %(default)s)")
+    ap.add_argument("--max-results", type=int, default=250,
+                    help="events per page, API max 250 (default: %(default)s)")
+    ap.add_argument("--max-pages", type=int, default=10,
+                    help="pages of results to walk (default: %(default)s)")
     args = ap.parse_args()
 
     raw = args.url or args.url_opt
@@ -114,17 +121,22 @@ def main():
     # Clean first so dedup can run before fetch, on a possibly-dirty pasted URL.
     url = clean_url(raw.strip())
 
-    data = run_query(args.calendar_id, url, args.max_results)
-    items = data.get("items") or []
+    items, exhausted = run_query(args.calendar_id, url, args.max_results, args.max_pages)
 
-    target = normalize(url)
+    # Positional, not a substring search: PARTYPLANNER writes the URL first, so
+    # a real duplicate leads with it. A loose `in` check also matched a URL that
+    # merely appeared somewhere in the body -- including inside another link's
+    # query string -- and reported a duplicate that was not one.
+    target = normalize_url(url)
     matches = [summarize(it) for it in items
-               if target and target in normalize(it.get("description") or "")]
+               if target and leading_url(it.get("description") or "") == target]
 
     report = {
         "query_url": url,
         "duplicate": bool(matches),
         "count": len(matches),
+        "examined": len(items),
+        "results_exhausted": exhausted,
         "matches": matches,
     }
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)

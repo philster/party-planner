@@ -27,24 +27,49 @@ from urllib.parse import urlsplit
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from clean_url import clean_url                     # noqa: E402
 from extractors import extractor_for_host, extract_generic  # noqa: E402
-from httpfetch import FetchError                    # noqa: E402
+from httpfetch import FetchError, FetchRefused      # noqa: E402
+from untrusted import BANNER, UNTRUSTED_FIELDS, sanitize  # noqa: E402
 
 FALLBACK = 4
 
 
 def emit(event, as_json):
+    """Print the event with its remote-authored fields scrubbed and labelled.
+    The banner leads the output so the reader meets it before the content it
+    describes; `_untrusted_fields` names exactly which values a page controls."""
+    event = sanitize(event)
     if as_json:
-        json.dump(event, sys.stdout, indent=2, ensure_ascii=False)
+        json.dump({"_warning": BANNER,
+                   "_untrusted_fields": list(UNTRUSTED_FIELDS),
+                   **event},
+                  sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
         return
+    print("!! " + BANNER + "\n")
     print("platform    : " + str(event.get("platform")))
     print("title       : " + str(event.get("title")))
     print("date/time   : %s (%s)" % (event.get("datetime_display"), event.get("timezone")))
     print("location    : " + str(event.get("location")))
     print("event-id    : " + str(event.get("event_id")))
     print("url         : " + str(event.get("url")))
-    print("description :")
+    print("description : ---- begin untrusted page text ----")
     print(event.get("description") or "(none)")
+    print("---- end untrusted page text ----")
+
+
+def refuse(err):
+    """Exit on a URL policy forbids -- and say so, rather than falling back.
+
+    The fallback path tells the agent to fetch the page some other way. That is
+    right for a page this script cannot parse, and wrong for a local file or an
+    internal address: the same sentence would talk the agent into retrieving
+    what the guard exists to block."""
+    print("fetch_event: %s\n"
+          "  -> this URL is not fetchable by policy. Do NOT retrieve it by any\n"
+          "     other means. Tell the user the link points somewhere this skill\n"
+          "     will not read (a local file or a non-public address)." % err,
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def main():
@@ -68,6 +93,8 @@ def main():
         name, fn = match
         try:
             emit(fn(url), args.json)
+        except FetchRefused as err:
+            refuse(err)
         except FetchError as err:
             print("fetch_event: %s extraction failed: %s" % (name, err),
                   file=sys.stderr)
@@ -77,6 +104,8 @@ def main():
     # Unknown host: best-effort generic reader, else defer to the agent.
     try:
         event = extract_generic(url, args.default_tz)
+    except FetchRefused as err:
+        refuse(err)
     except FetchError as err:
         print("fetch_event: unsupported host %r and generic read failed: %s\n"
               "  -> use web retrieval and build the normalized JSON by hand."

@@ -25,8 +25,17 @@ cross-URL duplicate, and asking before anything gets written.
   lives here, in one place, so nobody hand-assembles an insert body or
   hand-computes a timezone offset.
 - `bin/create_event` — the only script that writes. It wraps `gws calendar
-  events insert` and only runs after the user has approved the event; it also
-  supports `--dry-run`.
+  events insert` and requires `--approve-token`, the digest `build_payload`
+  printed for that exact body, so the payload the user approved is provably the
+  one that gets written. Also supports `--dry-run`.
+
+Fetched page content is treated as hostile throughout: `fetch_event` caps,
+de-tags, and strips control characters from every remote-authored field,
+rejects non-`http(s)` URLs, and labels the rest so the agent reads it as data
+rather than as instruction. Pair this with a host permission rule denying
+`gws calendar events insert|patch|update|delete|import|move`, which stops an
+agent from routing around the approval gate without affecting `create_event`
+(its write happens inside the script).
 - `bin/plan_day` — a sorted agenda for a given day.
 
 The full flow and exact flags are in [`SKILL.md`](SKILL.md).
