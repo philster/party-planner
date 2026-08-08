@@ -8,9 +8,8 @@
 #
 # What it does (idempotent):
 #   * mirrors bin/ and lib/ with --delete (prunes files removed from source)
-#   * excludes __pycache__ / *.pyc / tests
-#   * strips the "BUILD STATUS" HTML comment out of SKILL.md
-#   * installs the Codex SKILL.md and AGENTS.md instructions
+#   * excludes __pycache__ / *.pyc
+#   * installs SKILL.md and the AGENTS.md instructions verbatim
 #   * marks bin/ scripts executable
 set -euo pipefail
 
@@ -31,22 +30,13 @@ fi
 rsync -a --delete $DRY "${RSYNC_EXCLUDES[@]}" "$SRC/bin/" "$DST/bin/"
 rsync -a --delete $DRY "${RSYNC_EXCLUDES[@]}" "$SRC/lib/" "$DST/lib/"
 
-# SKILL.md: copy with the in-project BUILD STATUS comment stripped.
-# AGENTS.md: copy the supplemental Codex agent instructions as-is.
+# SKILL.md and the supplemental Codex AGENTS.md: both deployed as-is.
 if [ -n "$DRY" ]; then
-  echo "would write $DST/SKILL.md (BUILD STATUS block stripped)"
+  echo "would write $DST/SKILL.md"
   echo "would write $DST/AGENTS.md"
 else
-  python3 - "$SRC/SKILL.md" "$DST/SKILL.md" "$SRC/AGENTS.md" "$DST/AGENTS.md" <<'PY'
-import re, sys
-skill_src, skill_dst, agents_src, agents_dst = sys.argv[1:5]
-
-text = open(skill_src, encoding="utf-8").read()
-text = re.sub(r"\n<!-- BUILD STATUS.*?-->\n", "\n", text, count=1, flags=re.S)
-open(skill_dst, "w", encoding="utf-8").write(text)
-
-open(agents_dst, "w", encoding="utf-8").write(open(agents_src, encoding="utf-8").read())
-PY
+  cp "$SRC/SKILL.md" "$DST/SKILL.md"
+  cp "$SRC/AGENTS.md" "$DST/AGENTS.md"
   chmod +x "$DST"/bin/*
 fi
 

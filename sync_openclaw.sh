@@ -7,8 +7,8 @@
 #
 # What it does (idempotent):
 #   * mirrors bin/ and lib/ with --delete (prunes files removed from source)
-#   * excludes __pycache__ / *.pyc / tests
-#   * strips the "BUILD STATUS" HTML comment out of SKILL.md
+#   * excludes __pycache__ / *.pyc
+#   * copies SKILL.md verbatim
 #   * marks bin/ scripts executable
 set -euo pipefail
 
@@ -28,17 +28,11 @@ fi
 rsync -a --delete $DRY "${RSYNC_EXCLUDES[@]}" "$SRC/bin/" "$DST/bin/"
 rsync -a --delete $DRY "${RSYNC_EXCLUDES[@]}" "$SRC/lib/" "$DST/lib/"
 
-# SKILL.md: copy with the in-project BUILD STATUS comment stripped.
+# SKILL.md: deployed as-is.
 if [ -n "$DRY" ]; then
-  echo "would write $DST/SKILL.md (BUILD STATUS block stripped)"
+  echo "would write $DST/SKILL.md"
 else
-  python3 - "$SRC/SKILL.md" "$DST/SKILL.md" <<'PY'
-import re, sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-text = re.sub(r"\n<!-- BUILD STATUS.*?-->\n", "\n", text, count=1, flags=re.S)
-open(dst, "w", encoding="utf-8").write(text)
-PY
+  cp "$SRC/SKILL.md" "$DST/SKILL.md"
   chmod +x "$DST"/bin/*
 fi
 

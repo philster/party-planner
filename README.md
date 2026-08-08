@@ -71,9 +71,8 @@ Run them from inside this directory.
 DST=/path ./sync_claude.sh    # deploy somewhere else
 ```
 
-This also installs `SKILL.md`, with the in-project "BUILD STATUS" comment
-stripped out first. Claude Code picks the skill up automatically once
-`~/.claude/skills/party-planner/SKILL.md` exists.
+This also installs `SKILL.md` as-is. Claude Code picks the skill up
+automatically once `~/.claude/skills/party-planner/SKILL.md` exists.
 
 ### Codex
 
@@ -95,8 +94,7 @@ its own operating instructions.
 DST=/path ./sync_openclaw.sh    # deploy somewhere else
 ```
 
-This installs `SKILL.md`, with the in-project "BUILD STATUS" comment stripped
-out first, same as the Claude Code install.
+This installs `SKILL.md` as-is, same as the Claude Code install.
 
 ### Hermes Agent
 
