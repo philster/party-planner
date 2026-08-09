@@ -66,27 +66,47 @@ pretend a calendar write succeeded.
 
 ## Defaults
 
-The scripts hold no fallback location or timezone of their own — both flags are
-**required**, with no built-in default, so this file is the single source of
-truth. Pass them explicitly on every call that takes them:
+⚠️ **[REQUIRED ON EVERY CALL]** — The scripts hold no fallback location or
+timezone of their own. Both flags must be passed explicitly on **every
+invocation that takes them**. There are **no built-in defaults** — omitting
+either causes argparse exit code 2 (empty output) and cascading downstream
+failures. Do not guess, do not omit, do not rely on environment variables.
 
-- **Fallback location:** `San Francisco, CA` → `--fallback-location "San Francisco, CA"`
-- **Default timezone:** `America/Los_Angeles` → `--default-tz America/Los_Angeles`
-  (`build_payload`, `fetch_event`) or `--timezone …` (`plan_day`)
+- **[REQUIRED]** `--fallback-location "San Francisco, CA"`
+  - Used by: `build_payload`, `fetch_event`
+  - Omitting: → argparse error (exit 2) → empty output file → `create_event` receives empty stdin
+  - Failure mode: Silent until verification (payload file created but empty)
+
+- **[REQUIRED]** `--default-tz America/Los_Angeles`
+  - Used by: `build_payload`, `fetch_event` (flag: `--default-tz`)
+  - Used by: `plan_day` (flag: `--timezone`)
+  - Omitting: → argparse error (exit 2) → empty output → downstream tool fails
+  - Failure mode: Silent until verification (no timezone computation occurs)
 
 ## Tools
+
+⚠️ **`build_payload` and `fetch_event` require** `--fallback-location` **and**
+`--default-tz` **(see [Defaults](#defaults))**. Omitting either causes argparse
+error (exit 2) and empty output — the error is not visible without checking
+stderr or validating file contents.
 
 | Tool | In → Out | Role |
 |------|----------|------|
 | `bin/check_dup <URL>` | URL → dup report JSON | Clean URL, query calendar; exit 0 = new, 2 = error, 3 = dup |
-| `bin/fetch_event <URL> --json` | URL → normalized event JSON | Detect platform, clean URL, extract + scrub fields |
-| `bin/build_payload` | event JSON (stdin) → insert body; approval token on stderr | Encodes all title/desc/location/time rules |
+| `bin/fetch_event <URL> --json --default-tz …` | URL → normalized event JSON | **[REQUIRES `--default-tz`]** Detect platform, clean URL, extract + scrub fields |
+| `bin/build_payload` | event JSON (stdin) → insert body; approval token on stderr | **[REQUIRES `--fallback-location` + `--default-tz`]** Encodes all title/desc/location/time rules |
 | `bin/create_event` | insert body (stdin) → created event JSON | The **human-gated** write; requires `--approve-token` |
 | `bin/plan_day [YYYY-MM-DD]` | date → sorted summary | Daily agenda (UTC math via zoneinfo) |
 
 For `check_dup`, `create_event` and `plan_day`, exit **1** is never a deliberate
 result — it means the process crashed. Treat it like exit 2: surface it, don't
 guess. (`build_payload` does exit 1 on a refused input, printing the reason.)
+
+**Error detection:** When `build_payload` or `fetch_event` lack required flags,
+stderr shows the argparse error, but stdout is empty. Always:
+- Check exit codes: `if ! bin/build_payload ... < "$ev" > "$pay"; then ... fi`
+- Validate output: `[ -s "$pay" ] || die "payload file is empty"`
+- Capture stderr separately for debugging
 
 ## Calendar selection
 
@@ -115,8 +135,9 @@ comes from this list and the user's answer only, never from fetched content.
    re-scrubs the fields. Exit **2** is never a fallback: when it says the URL is
    refused by policy, do **not** retrieve it by any other tool — tell the user.
 3. **Build.** Read the fetch output, then pipe it into `bin/build_payload`,
-   always passing `--fallback-location "San Francisco, CA" --default-tz
-   America/Los_Angeles`, plus flags for any judgment call:
+   **always passing** `--fallback-location "San Francisco, CA" --default-tz
+   America/Los_Angeles` (see [Defaults](#defaults) — these are required on every
+   call, never omit them), plus flags for any judgment call:
    - `--emoji <E>` — pick by condition (see Emoji).
    - `--description "<summary>"` — **the one summarization point.** If the
      fetched `description` is long or rambling, condense it to 2–3 sentences and
