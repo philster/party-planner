@@ -13,6 +13,10 @@ PARTYPLANNER always writes the URL first in the description, a real duplicate
 always contains it verbatim. Matching is a plain substring check on the stored
 description, so it does not depend on any timezone -- no --timezone flag here.
 
+By default the search is bounded to the past year (--time-min defaults to 365
+days ago). Use --all-time to search unbounded, or --time-min/--time-max with
+RFC 3339 timestamps for a custom window.
+
 Output: a JSON report on stdout, always.
 Exit codes (so `check_dup <url> && create_event ...` reads naturally):
   0  no duplicate  -> safe to create
@@ -31,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from clean_url import clean_url, leading_url, normalize_url  # noqa: E402
@@ -43,13 +48,17 @@ def die(msg):
     sys.exit(ERROR)
 
 
-def run_page(calendar_id, url, max_results, page_token):
+def run_page(calendar_id, url, max_results, page_token, time_min=None, time_max=None):
     params = {
         "calendarId": calendar_id,
         "q": url,
         "maxResults": max_results,
         "singleEvents": True,
     }
+    if time_min:
+        params["timeMin"] = time_min
+    if time_max:
+        params["timeMax"] = time_max
     if page_token:
         params["pageToken"] = page_token
     cmd = ["gws", "calendar", "events", "list", "--params", json.dumps(params)]
@@ -73,7 +82,7 @@ def run_page(calendar_id, url, max_results, page_token):
         die("could not parse gws response: %s" % err)
 
 
-def run_query(calendar_id, url, max_results, max_pages):
+def run_query(calendar_id, url, max_results, max_pages, time_min=None, time_max=None):
     """Walk every page of results rather than judging on the first.
 
     `q` is a loose full-text search, so a busy calendar can push the real match
@@ -81,7 +90,7 @@ def run_query(calendar_id, url, max_results, max_pages):
     an event that already exists. Returns (items, exhausted)."""
     items, token = [], None
     for _ in range(max_pages):
-        data = run_page(calendar_id, url, max_results, token)
+        data = run_page(calendar_id, url, max_results, token, time_min, time_max)
         items.extend(data.get("items") or [])
         token = data.get("nextPageToken")
         if not token:
@@ -113,6 +122,12 @@ def main():
                     help="events per page, API max 250 (default: %(default)s)")
     ap.add_argument("--max-pages", type=int, default=10,
                     help="pages of results to walk (default: %(default)s)")
+    ap.add_argument("--time-min",
+                    help="lower bound (RFC 3339) for event start time (default: 1 year ago)")
+    ap.add_argument("--time-max",
+                    help="upper bound (RFC 3339) for event start time (default: none)")
+    ap.add_argument("--all-time", action="store_true",
+                    help="search all events, override the default 1-year window")
     args = ap.parse_args()
 
     raw = args.url or args.url_opt
@@ -121,7 +136,14 @@ def main():
     # Clean first so dedup can run before fetch, on a possibly-dirty pasted URL.
     url = clean_url(raw.strip())
 
-    items, exhausted = run_query(args.calendar_id, url, args.max_results, args.max_pages)
+    if args.all_time:
+        time_min, time_max = None, None
+    else:
+        time_min = args.time_min or (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        time_max = args.time_max
+
+    items, exhausted = run_query(args.calendar_id, url, args.max_results, args.max_pages,
+                                 time_min, time_max)
 
     # Positional, not a substring search: PARTYPLANNER writes the URL first, so
     # a real duplicate leads with it. A loose `in` check also matched a URL that
