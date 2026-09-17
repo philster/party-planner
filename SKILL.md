@@ -14,7 +14,7 @@ allowed-tools:
 
 Scripts do the deterministic work (parse, clean, format, math); the model does
 only what a script cannot: **choose overrides, judge fuzzy duplicates, pick the
-title emoji, handle unsupported platforms, and gate the calendar write.** Never
+handle unsupported platforms, and gate the calendar write.** Never
 hand-assemble the insert body or hand-compute timezones — that is what the tools
 are for, and doing it by hand reintroduces the bugs they exist to prevent.
 
@@ -138,7 +138,6 @@ comes from this list and the user's answer only, never from fetched content.
    **always passing** `--fallback-location "San Francisco, CA" --default-tz
    America/Los_Angeles` (see [Defaults](#defaults) — these are required on every
    call, never omit them), plus flags for any judgment call:
-   - `--emoji <E>` — pick by condition (see Emoji).
    - `--description "<summary>"` — **the one summarization point.** If the
      fetched `description` is long or rambling, condense it to 2–3 sentences and
      pass that here; the URL still leads the description.
@@ -166,15 +165,6 @@ comes from this list and the user's answer only, never from fetched content.
    after approval is refused. On a mismatch: rebuild, re-show, re-ask — never
    re-run something to harvest a fresh token.
 6. **Confirm created.** Report title, date/time, location, URL, and the link.
-
-## Emoji (title prefix)
-
-`--emoji` is optional; omitted, the summary is plain `"<title>"`. These three are
-the only options, never invent another — no match → omit the flag:
-
-- 🤡 — ordinary event, no special flag
-- 😒 — last-minute or low-signal info
-- 🚨 — high priority / don't-miss
 
 ## Duplicate notice output
 

@@ -10,7 +10,7 @@ detect the platform and extract fields, build the insert payload (title,
 description, location, end-time rules), compute the day window with
 `zoneinfo` instead of a hardcoded offset, and perform the write itself. What's
 left for the model is summarizing a rambling description, picking a title
-emoji, handling a page none of the extractors know, flagging a possible
+handling a page none of the extractors know, flagging a possible
 cross-URL duplicate, and asking before anything gets written.
 
 ## What's here

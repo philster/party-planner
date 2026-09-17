@@ -9,7 +9,7 @@ after explicit user approval.
 
 The scripts do deterministic work: URL cleaning, extraction, date/time math,
 payload construction, and calendar queries. The agent handles only judgment:
-summarizing descriptions, choosing an emoji, supplying fallback location or end
+summarizing descriptions, supplying fallback location or end
 time, judging possible cross-URL duplicates, handling unsupported pages, and
 gating the calendar write.
 
@@ -144,8 +144,6 @@ Ask again at the start of each new run — the choice is not persisted.
    `--fallback-location "San Francisco, CA" --default-tz America/Los_Angeles`,
    plus flags for any judgment call:
 
-   - `--emoji <E>`: title prefix; optional, no default — omitted, the summary
-     is the bare title (see [Emoji guidance](#emoji-guidance)).
    - `--description "<summary>"`: a concise 2–3 sentence summary after reading
      the fetched description. This is the only summarization point.
    - `--location "<address>"`: fallback when the published location is gated or
@@ -218,14 +216,6 @@ hardcoded UTC offset.
 - A published end wins; otherwise the end defaults to start plus two hours.
 - The default timezone is `--default-tz` (see [Defaults](#defaults)); valid
   event IANA zones win.
-
-## Emoji guidance
-
-Only these three; never invent another. No match → omit `--emoji`.
-
-- 🤡: ordinary event, no special flag
-- 😒: last-minute or low-signal information
-- 🚨: high-priority or do-not-miss event
 
 ## URL cleaning
 

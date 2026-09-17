@@ -10,8 +10,7 @@ Reads the normalized JSON on stdin (or --input FILE), writes the JSON body for
 `gws calendar events insert --json` to stdout.
 
 Rules encoded here (so the LLM never hand-assembles them):
-  * summary     = "<emoji> <title>" if --emoji given, else "<title>"
-                                              (title whitespace-collapsed)
+  * summary     = "<title>"                    (whitespace-collapsed)
   * description = "<url>\n\n<description>"    (URL is ALWAYS first, exact order;
                                               body is --description if given,
                                               else the fetched full text)
@@ -150,10 +149,6 @@ def main():
     ap.add_argument("--fallback-location", metavar="STRING", required=True,
                     help="location when none is published; see SKILL.md for "
                          "the caller's default")
-    ap.add_argument("--emoji",
-                    help="title prefix emoji; caller picks per condition, e.g. "
-                         "\U0001f921 default, \U0001f612 last-minute, "
-                         "\U0001f6a8 high priority (omit for no prefix)")
     ap.add_argument("--description", metavar="STRING",
                     help="use this description body instead of the fetched "
                          "full text (e.g. an LLM-summarized version); the URL "
@@ -197,8 +192,7 @@ def main():
             "the description (a non-http scheme is rejected outright)")
     url = clean_url(url)
 
-    title = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
-    summary = "%s %s" % (args.emoji, title) if args.emoji else title
+    summary = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
 
     body_desc = args.description if args.description is not None else (event.get("description") or "")
     body_desc = body_desc.strip()
