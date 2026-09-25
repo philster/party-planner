@@ -4,6 +4,9 @@
   fetch_event https://luma.com/3a3qsbxo --default-tz America/Los_Angeles
   fetch_event https://partiful.com/e/abc --json --default-tz America/Los_Angeles
 
+  fetch_event --out-dir "$D" --default-tz America/Los_Angeles \\
+    --item 1 https://luma.com/a --item 3 https://partiful.com/e/c
+
 Cleans the URL, detects the platform by host, dispatches to the matching
 extractor, and prints one normalized event. Unknown hosts fall back to a generic
 schema.org / OpenGraph reader; if even that finds nothing, exit 4 signals the
@@ -11,17 +14,30 @@ caller to use the agent's web retrieval tool and hand-build the same JSON shape.
 `--default-tz` is required and only affects the generic reader (registered
 platforms carry their own zone info); see SKILL.md for the caller's default.
 
-Exit codes:
-  0  event extracted
-  2  usage error, or a known platform failed to parse
-  4  unsupported page -> use the agent's web retrieval tool
+Batch mode (--out-dir DIR) fetches several URLs in parallel and writes each
+successful event, as JSON, to DIR/ev_N.json. `--item N URL` keeps the caller's
+numbering (so a URL dropped by check_dup leaves a gap instead of shifting the
+rest); bare positional URLs are numbered 1, 2, 3... Stdout is a JSON report,
+one entry per URL, whose `status` is:
+  ok           ev_N.json written
+  unsupported  use the agent's web retrieval tool on that URL (like exit 4)
+  refused      the URL is not fetchable by policy -- do NOT retrieve it
+  error        a known platform failed to parse
+Batch output is JSON only: the page text lives in files, never in a stdout
+stream where one page's description could impersonate another item's header.
 
-Requires: python3 (3.11+), curl; curl_cffi only for Splashthat.
+Exit codes:
+  0  event extracted (batch: every URL ok)
+  2  usage error, or a known platform failed to parse
+     (batch: at least one URL refused or errored)
+  4  unsupported page -> use the agent's web retrieval tool
+     (batch: at least one URL unsupported, none refused or errored)
 """
 import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
@@ -30,19 +46,59 @@ from extractors import extractor_for_host, extract_generic  # noqa: E402
 from httpfetch import FetchError, FetchRefused      # noqa: E402
 from untrusted import BANNER, UNTRUSTED_FIELDS, sanitize  # noqa: E402
 
-FALLBACK = 4
+OK, ERROR, FALLBACK = 0, 2, 4
+MAX_PARALLEL = 4
+
+REFUSED_ACTION = ("this URL is not fetchable by policy. Do NOT retrieve it by any "
+                  "other means. Tell the user the link points somewhere this skill "
+                  "will not read (a local file or a non-public address).")
+FALLBACK_ACTION = "use web retrieval and build the normalized JSON by hand."
+
+
+class Unsupported(Exception):
+    pass
+
+
+def extract(raw_url, default_tz):
+    """The scrubbed event for `raw_url`.
+
+    Raises FetchRefused for a URL policy forbids, FetchError when a known
+    platform fails, and Unsupported when neither a platform extractor nor the
+    generic reader can use the page."""
+    url = clean_url(raw_url.strip())
+    host = (urlsplit(url).hostname or "").lower()
+
+    match = extractor_for_host(host)
+    if match:
+        name, fn = match
+        try:
+            return sanitize(fn(url))
+        except FetchRefused:
+            raise
+        except FetchError as err:
+            raise FetchError("%s extraction failed: %s" % (name, err))
+
+    # Unknown host: best-effort generic reader, else defer to the agent.
+    try:
+        event = extract_generic(url, default_tz)
+    except FetchRefused:
+        raise
+    except FetchError as err:
+        raise Unsupported("unsupported host %r and generic read failed: %s" % (host, err))
+    if event is None:
+        raise Unsupported("unsupported host %r (no schema.org/OpenGraph event)" % host)
+    return sanitize(event)
+
+
+def labelled(event):
+    """The banner leads the object so the reader meets it before the content it
+    describes; `_untrusted_fields` names exactly which values a page controls."""
+    return {"_warning": BANNER, "_untrusted_fields": list(UNTRUSTED_FIELDS), **event}
 
 
 def emit(event, as_json):
-    """Print the event with its remote-authored fields scrubbed and labelled.
-    The banner leads the output so the reader meets it before the content it
-    describes; `_untrusted_fields` names exactly which values a page controls."""
-    event = sanitize(event)
     if as_json:
-        json.dump({"_warning": BANNER,
-                   "_untrusted_fields": list(UNTRUSTED_FIELDS),
-                   **event},
-                  sys.stdout, indent=2, ensure_ascii=False)
+        json.dump(labelled(event), sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
         return
     print("!! " + BANNER + "\n")
@@ -57,19 +113,67 @@ def emit(event, as_json):
     print("---- end untrusted page text ----")
 
 
-def refuse(err):
-    """Exit on a URL policy forbids -- and say so, rather than falling back.
+def run_single(url, args):
+    try:
+        emit(extract(url, args.default_tz), args.json)
+    except FetchRefused as err:
+        # Said outright rather than falling back: the fallback path tells the
+        # agent to fetch the page some other way, which is right for a page this
+        # script cannot parse and wrong for a local file or internal address.
+        print("fetch_event: %s\n  -> %s" % (err, REFUSED_ACTION), file=sys.stderr)
+        sys.exit(ERROR)
+    except FetchError as err:
+        print("fetch_event: %s" % err, file=sys.stderr)
+        sys.exit(ERROR)
+    except Unsupported as err:
+        print("fetch_event: %s\n  -> %s" % (err, FALLBACK_ACTION), file=sys.stderr)
+        sys.exit(FALLBACK)
 
-    The fallback path tells the agent to fetch the page some other way. That is
-    right for a page this script cannot parse, and wrong for a local file or an
-    internal address: the same sentence would talk the agent into retrieving
-    what the guard exists to block."""
-    print("fetch_event: %s\n"
-          "  -> this URL is not fetchable by policy. Do NOT retrieve it by any\n"
-          "     other means. Tell the user the link points somewhere this skill\n"
-          "     will not read (a local file or a non-public address)." % err,
-          file=sys.stderr)
-    sys.exit(2)
+
+def fetch_item(n, url, args):
+    head = {"n": n, "url": url}
+    try:
+        event = extract(url, args.default_tz)
+    except FetchRefused as err:
+        return {**head, "status": "refused", "error": str(err), "action": REFUSED_ACTION}
+    except FetchError as err:
+        return {**head, "status": "error", "error": str(err)}
+    except Unsupported as err:
+        return {**head, "status": "unsupported", "error": str(err), "action": FALLBACK_ACTION}
+    path = os.path.join(args.out_dir, "ev_%d.json" % n)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(labelled(event), fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    return {**head, "status": "ok", "file": path}
+
+
+def run_batch(items, args):
+    if not os.path.isdir(args.out_dir):
+        print("fetch_event: --out-dir %r is not a directory" % args.out_dir, file=sys.stderr)
+        sys.exit(ERROR)
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        results = list(pool.map(lambda item: fetch_item(*item, args), items))
+    json.dump({"results": results}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    statuses = {r["status"] for r in results}
+    sys.exit(ERROR if statuses & {"refused", "error"}
+             else FALLBACK if "unsupported" in statuses else OK)
+
+
+def numbered_items(ap, args):
+    if args.urls and args.items:
+        ap.error("pass URLs positionally or with --item, not both")
+    if args.urls:
+        return list(enumerate(args.urls, start=1))
+    items = []
+    for n, url in args.items:
+        if not n.isdigit() or int(n) < 1:
+            ap.error("--item number must be a positive integer, got %r" % n)
+        items.append((int(n), url))
+    numbers = [n for n, _ in items]
+    if len(set(numbers)) != len(numbers):
+        ap.error("--item numbers must be unique")
+    return items
 
 
 def main():
@@ -77,7 +181,13 @@ def main():
         prog="fetch_event",
         description="URL -> normalized event JSON (feeds build_payload).",
     )
-    ap.add_argument("url", help="event URL")
+    ap.add_argument("urls", nargs="*", metavar="url", help="event URL(s)")
+    ap.add_argument("--item", nargs=2, metavar=("N", "URL"), action="append",
+                    dest="items", default=[],
+                    help="batch mode: fetch URL as number N (writes ev_N.json); repeat")
+    ap.add_argument("--out-dir", metavar="DIR",
+                    help="batch mode: write each event to DIR/ev_N.json and print "
+                         "a JSON status report")
     ap.add_argument("--json", action="store_true", help="emit JSON (default: text)")
     ap.add_argument("--default-tz", metavar="IANA", required=True,
                     help="IANA zone used by the generic (unregistered-platform) "
@@ -85,38 +195,15 @@ def main():
                          "see the default-timezone setting in SKILL.md")
     args = ap.parse_args()
 
-    url = clean_url(args.url.strip())
-    host = (urlsplit(url).hostname or "").lower()
-
-    match = extractor_for_host(host)
-    if match:
-        name, fn = match
-        try:
-            emit(fn(url), args.json)
-        except FetchRefused as err:
-            refuse(err)
-        except FetchError as err:
-            print("fetch_event: %s extraction failed: %s" % (name, err),
-                  file=sys.stderr)
-            sys.exit(2)
-        return
-
-    # Unknown host: best-effort generic reader, else defer to the agent.
-    try:
-        event = extract_generic(url, args.default_tz)
-    except FetchRefused as err:
-        refuse(err)
-    except FetchError as err:
-        print("fetch_event: unsupported host %r and generic read failed: %s\n"
-              "  -> use web retrieval and build the normalized JSON by hand."
-              % (host, err), file=sys.stderr)
-        sys.exit(FALLBACK)
-    if event is None:
-        print("fetch_event: unsupported host %r (no schema.org/OpenGraph event)\n"
-              "  -> use web retrieval and build the normalized JSON by hand."
-              % host, file=sys.stderr)
-        sys.exit(FALLBACK)
-    emit(event, args.json)
+    items = numbered_items(ap, args)
+    if not items:
+        ap.error("no URL given")
+    if args.out_dir:
+        run_batch(items, args)
+    elif len(items) > 1 or args.items:
+        ap.error("several URLs or --item need --out-dir")
+    else:
+        run_single(items[0][1], args)
 
 
 if __name__ == "__main__":

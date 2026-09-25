@@ -96,13 +96,15 @@ takes them; do not guess or hand-roll a different default:
 
 | Tool | Input → output | Purpose |
 |---|---|---|
-| `bin/check_dup <URL>` | URL → duplicate report JSON | Cleans the URL and queries the calendar |
-| `bin/fetch_event <URL> --json` | URL → normalized event JSON | Detects the platform, extracts and scrubs fields |
-| `bin/build_payload` | event JSON on stdin → insert body JSON; approval token on stderr | Applies title, description, location, and time rules |
-| `bin/create_event` | insert body on stdin → created event JSON | Performs the gated calendar write; requires `--approve-token` |
+| `bin/check_dup <URL>...` | URL(s) → duplicate report JSON (2+ URLs: `results` array) | Cleans the URL and queries the calendar |
+| `bin/fetch_event <URL> --json` | URL → normalized event JSON; or `--out-dir D --item N URL`... → `D/ev_N.json` + status report | Detects the platform, extracts and scrubs fields |
+| `bin/build_payload` | event JSON on stdin → insert body JSON; or `--input-dir D [--manifest F]` → `D/pay_N.json` + report; approval token(s) on stderr | Applies title, description, location, and time rules |
+| `bin/create_event` | insert body on stdin, or `--input-dir D` for every `pay_N.json` → created event JSON | Performs the gated calendar write; requires `--approve-token` (one per approved event) |
 | `bin/plan_day [YYYY-MM-DD]` | date → agenda | Queries and sorts the day's events |
 
 `check_dup` exit codes are 0 = no duplicate, 3 = duplicate, and 2 = error.
+`create_event` exit codes are 0 = created, 3 = already exists (nothing
+written), and 2 = error.
 `fetch_event` exits 0 when extraction succeeds, 2 for a known-platform or usage
 error, and 4 when the page is unsupported and needs web-tool fallback. Only 4 is
 a fallback: when exit 2 reports that the URL is refused by policy (a local file
@@ -247,7 +249,9 @@ Use this for one URL. For two or more, use [Add many events](#add-many-events).
    `{"created": true, "id", "summary", "start", "location", "htmlLink"}`, or
    `{"error": "..."}` with a nonzero exit. Report the created title, date/time,
    location, URL, and `htmlLink`. Treat a nonzero exit or a missing
-   `"created": true` as a failed write. Delete the temp directory only after
+   `"created": true` as a failed write. Exit 3 (`"duplicate": true`) means
+   `create_event`'s own last check found the event already on the calendar:
+   report its `matches`; nothing was written. Delete the temp directory only after
    this report, in a separate command.
 
 ## Approval tokens
@@ -269,46 +273,54 @@ every output header, and every table below. Never renumber.
 0. Ask for the calendar once for the whole request (see
    [Calendar selection](#calendar-selection--ask-every-time)) and wait.
 
-1. Dedup all in one command, no pipes:
+1. Dedup all in one command — every URL, in the user's order, so each gets its
+   number:
 
    ```sh
    D=$(mktemp -d); echo "D=$D"
-   i=0
-   for u in "<URL1>" "<URL2>" "<URL3>"; do
-     i=$((i+1)); echo "=== [$i] $u"
-     <SKILL_DIR>/bin/check_dup "$u" --calendar-id <picked>; echo "[$i] exit=$?"
-   done
+   <SKILL_DIR>/bin/check_dup --calendar-id <picked> "<URL1>" "<URL2>" "<URL3>"; echo "exit=$?"
    ```
 
-   Drop every URL with exit 3 (report it as a duplicate) or exit 2 (report the
-   error). Keep the remaining numbers unchanged — if [2] is a duplicate, the
-   rest are still [1], [3], [4].
+   Read the `results` array; each entry has its number `n` and a `status`. Keep
+   `new`. Drop `duplicate` (report its `matches`), `repeat` (the same event as
+   number `same_as`; report it as pasted twice), and `error` (report the
+   error). Keep the remaining numbers unchanged — if [2] is dropped, the rest
+   are still [1], [3], [4].
 
-2. Fetch the kept ones in one command, one file per number, then read each
-   `ev_N.json`:
+2. Fetch the kept ones in one command, passing each number with `--item`:
 
    ```sh
-   <SKILL_DIR>/bin/fetch_event "<URL1>" --json --default-tz America/Los_Angeles \
-     >"<D>/ev_1.json"; echo "[1] exit=$?"
-   <SKILL_DIR>/bin/fetch_event "<URL3>" --json --default-tz America/Los_Angeles \
-     >"<D>/ev_3.json"; echo "[3] exit=$?"
+   <SKILL_DIR>/bin/fetch_event --out-dir "<D>" --default-tz America/Los_Angeles \
+     --item 1 "<URL1>" --item 3 "<URL3>"; echo "exit=$?"
    ```
 
-3. Build in one command, each with its own summary and a header line:
+   Read the `results` array, then each `ev_N.json` with `status: ok`. For
+   `unsupported`, follow [Unsupported pages](#unsupported-pages-exit-4) and
+   write the object to `<D>/ev_N.json` with that number. For `refused`, do not
+   retrieve it by any other means — tell the user. For `error`, report it.
+
+3. Build in one command. First write `<D>/manifest.json` with your
+   file-writing tool — one entry per number, holding that event's summary and
+   any fallback:
+
+   ```json
+   {"1": {"description": "<summary 1>"},
+    "3": {"description": "<summary 3>", "end_date": "9pm"}}
+   ```
+
+   Allowed fields: `description`, `location`, `end_date` (the same judgment
+   calls as `--description`, `--location`, `--end-date`). Then:
 
    ```sh
-   echo "=== [1] <URL1>"
-   <SKILL_DIR>/bin/build_payload --description "<summary 1>" \
-     --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles \
-     <"<D>/ev_1.json" >"<D>/pay_1.json"; echo "[1] exit=$?"
-   echo "=== [3] <URL3>"
-   <SKILL_DIR>/bin/build_payload --description "<summary 3>" \
-     --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles \
-     <"<D>/ev_3.json" >"<D>/pay_3.json"; echo "[3] exit=$?"
+   <SKILL_DIR>/bin/build_payload --input-dir "<D>" --manifest "<D>/manifest.json" \
+     --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles; echo "exit=$?"
    ```
 
-   Each token appears under its own `=== [N]` header. Read `pay_N.json` for the
-   details to show.
+   It writes `pay_N.json` for every `ev_N.json`. Stdout is a `results` array
+   with each number's finalized `title`, `start`, `end`, `location`, and `url`
+   — show those. Each token appears on its own
+   `build_payload: [N] approval-token sha256:...` line. A `status: error` entry
+   was not built; report it.
 
 4. Show one table and ask which to create:
 
@@ -318,19 +330,25 @@ every output header, and every table below. Never renumber.
    The user may approve all, some ("1 and 3"), or none. Only a number the user
    approved gets created.
 
-5. Create each approved number with **its own** token and payload file:
+5. Create every approved number in one call: pass the directory and one
+   `--approve-token` per approved number. Never pass a token for a number the
+   user did not approve.
 
    ```sh
-   echo "=== [1]"
-   <SKILL_DIR>/bin/create_event --calendar-id <picked> \
-     --approve-token <token from [1]> <"<D>/pay_1.json"; echo "[1] exit=$?"
+   <SKILL_DIR>/bin/create_event --calendar-id <picked> --input-dir "<D>" \
+     --approve-token <token from [1]> --approve-token <token from [3]>; echo "exit=$?"
    ```
 
-   Before running, check each line: the `[N]` in the header, the token's
-   source header, and `pay_N.json` must be the same N.
+   `create_event` pairs each token with the `pay_N.json` whose body it was
+   computed over, so token order does not matter. A `pay_N.json` with no
+   matching token is skipped, not written. If any token matches no payload,
+   nothing is written: rebuild that number, re-show, and re-ask.
 
-6. Report one row per number: created (with `htmlLink`), duplicate, failed
-   (with the error), or skipped by the user.
+6. Report one row per number from the output's `results` array, keyed by `n`:
+   `status` is `created` (report `htmlLink`), `duplicate` (report `matches`),
+   `error` (report `error`), or `skipped` (not approved) — plus the numbers
+   `check_dup` dropped in step 1. Exit 0 means every approved number was
+   created, 3 that at least one already existed, 2 that at least one failed.
 
 ## Unsupported pages (exit 4)
 

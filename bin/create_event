@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Create a calendar event from a build_payload body. The human-gated write:
-run it only after the user has approved the event.
+"""Create calendar events from build_payload bodies. The human-gated write:
+run it only after the user has approved each event.
 
   create_event --calendar-id primary --approve-token sha256:… < payload.json
   create_event --calendar-id primary --approve-token sha256:… --input payload.json
   create_event --calendar-id primary --dry-run < payload.json      # validate, do not write
 
-Reads the insert body (build_payload output) on stdin or --input FILE, inserts
+  create_event --calendar-id primary --input-dir "$D" \\
+    --approve-token sha256:<from [1]> --approve-token sha256:<from [3]>
+
+Reads one insert body (build_payload output) on stdin or --input FILE, inserts
 it via `gws calendar events insert`, and prints a compact confirmation JSON
 (id, summary, start, location, htmlLink).
+
+Batch mode (--input-dir DIR) reads every `pay_N.json` in DIR. Each token is
+matched to the body it was computed over -- by hash, not by file name or
+position -- so a token cannot land on the wrong event. Bodies no token matches
+were not approved and are skipped. Every token is checked before anything is
+written: one that matches no body, or more than one, refuses the whole batch.
 
 `--approve-token` is the mechanical half of the approval gate. build_payload
 prints the token for the body it produced; this script recomputes it over the
@@ -17,9 +26,15 @@ or swapped after the user said yes -- a race on a predictable temp filename, or
 an injected instruction to "just tweak one field" -- cannot reach the calendar
 under the old approval.
 
+Right before each insert, the calendar is searched for an event already leading
+with the body's URL (the same check as `check_dup`). A hit is not written: it
+catches a retry after an insert that timed out but actually landed.
+
 Exit codes:
-  0  created (or validated with --dry-run)
-  2  error (bad usage, missing/mismatched approval token, gws failure)
+  0  every approved body created (or validated with --dry-run)
+  2  error (bad usage, missing/mismatched approval token, gws failure);
+     in batch mode, any body failed
+  3  the event already exists; nothing written for it
 
   1 is not used by this script. argparse itself exits 2 on bad usage, and an
   unhandled exception exits 1 -- so a bare 1 means the script crashed, not
@@ -31,79 +46,129 @@ Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from approval import matches  # noqa: E402
+from calendar_query import CalendarQueryError, default_time_min, find_url_matches  # noqa: E402
+from clean_url import clean_url  # noqa: E402
+
+CREATED, ERROR, DUPLICATE = 0, 2, 3
+PAYLOAD_NAME_RE = re.compile(r"^pay_(\d+)\.json$")
+LEADING_URL_RE = re.compile(r"^(https?://\S+)")
+
+
+class WriteError(RuntimeError):
+    pass
 
 
 def die(msg):
     print(json.dumps({"error": msg}), file=sys.stdout)
-    sys.exit(2)
+    sys.exit(ERROR)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        prog="create_event",
-        description="Insert a build_payload body into the calendar (gated write).",
-    )
-    ap.add_argument("--input", metavar="FILE",
-                    help="read the insert body from FILE instead of stdin")
-    ap.add_argument("--calendar-id", required=True,
-                    help="target calendar (required, e.g. from `gws calendar calendarList list`)")
-    ap.add_argument("--approve-token", metavar="TOKEN",
-                    help="the approval token build_payload printed to stderr for "
-                         "this exact body; required for a real write, so the "
-                         "approved payload is provably the written one")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="validate the request without writing (no token needed)")
-    args = ap.parse_args()
-
-    try:
-        raw = open(args.input, encoding="utf-8").read() if args.input else sys.stdin.read()
-    except OSError as err:
-        die("could not read input: %s" % err)
+def parse_body(raw, source):
     if not raw.strip():
-        die("no input (expected a build_payload body on stdin)")
+        raise WriteError("%s is empty (expected a build_payload body)" % source)
     try:
         body = json.loads(raw)
     except json.JSONDecodeError as err:
-        die("input is not valid JSON: %s" % err)
+        raise WriteError("%s is not valid JSON: %s" % (source, err))
     if not isinstance(body, dict) or not body.get("summary") or not body.get("start"):
-        die("input does not look like an insert body (need summary + start)")
+        raise WriteError("%s does not look like an insert body (need summary + start)" % source)
+    return body
 
-    if not args.dry_run:
-        if not args.approve_token:
-            # Deliberately does not print the correct token: echoing it here
-            # would turn a missing-token error into an oracle, and any caller
-            # could mint approval for a body nobody looked at.
-            die("refusing to write without --approve-token: re-run build_payload "
-                "to get the token for this body, show the user the payload, and "
-                "pass the token once they approve it")
-        if not matches(args.approve_token, body):
-            die("approval token does not match this body -- it changed after it "
-                "was approved. Refusing to write. Re-run build_payload, show the "
-                "user the new payload, and get approval again.")
 
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as err:
+        raise WriteError("could not read %s: %s" % (path, err))
+
+
+def load_single(input_path):
+    raw = read_file(input_path) if input_path else sys.stdin.read()
+    return parse_body(raw, input_path or "stdin")
+
+
+def load_dir(directory):
+    """Every pay_N.json in `directory`, ordered by N, as (n, path, body)."""
+    try:
+        names = os.listdir(directory)
+    except OSError as err:
+        raise WriteError("could not list %s: %s" % (directory, err))
+    numbered = sorted((int(m.group(1)), name) for name in names
+                      if (m := PAYLOAD_NAME_RE.match(name)))
+    if not numbered:
+        raise WriteError("no pay_N.json files in %s" % directory)
+    loaded = []
+    for n, name in numbered:
+        path = os.path.join(directory, name)
+        loaded.append((n, path, parse_body(read_file(path), path)))
+    return loaded
+
+
+def approved_indexes(tokens, bodies):
+    """Map each token to the one body it was computed over.
+
+    Raises before anything is written when a token matches no body (the body
+    changed after approval), more than one (identical bodies would insert the
+    same event twice), or a body another token already claimed."""
+    approved = set()
+    for token in tokens:
+        hits = [i for i, body in enumerate(bodies) if matches(token, body)]
+        if not hits:
+            raise WriteError(
+                "approval token %s matches no payload -- a body changed after it "
+                "was approved. Refusing to write anything. Re-run build_payload, "
+                "show the user the new payload, and get approval again." % token[:23])
+        if len(hits) > 1:
+            raise WriteError("approval token %s matches %d identical payloads; "
+                             "refusing to write anything" % (token[:23], len(hits)))
+        if hits[0] in approved:
+            raise WriteError("two approval tokens match the same payload; "
+                             "refusing to write anything")
+        approved.add(hits[0])
+    return approved
+
+
+def event_url(body):
+    """The URL build_payload put first in the description, cleaned the same way
+    check_dup cleans it before searching."""
+    hit = LEADING_URL_RE.match((body.get("description") or "").strip())
+    if not hit:
+        raise WriteError("body description does not lead with the event URL; "
+                         "not a build_payload body")
+    return clean_url(hit.group(1))
+
+
+def existing_events(calendar_id, body):
+    try:
+        found, _, _ = find_url_matches(calendar_id, event_url(body), default_time_min())
+    except CalendarQueryError as err:
+        raise WriteError("duplicate check before insert failed: %s" % err)
+    return found
+
+
+def insert(calendar_id, body, dry_run):
     cmd = ["gws", "calendar", "events", "insert",
-           "--params", json.dumps({"calendarId": args.calendar_id}),
+           "--params", json.dumps({"calendarId": calendar_id}),
            "--json", json.dumps(body, ensure_ascii=False)]
-    if args.dry_run:
+    if dry_run:
         cmd.append("--dry-run")
-
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        die("`gws` not found on PATH")
+        raise WriteError("`gws` not found on PATH")
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
-        die("gws insert failed (exit %d): %s" % (proc.returncode, detail[:500]))
+        raise WriteError("gws insert failed (exit %d): %s" % (proc.returncode, detail[:500]))
 
-    if args.dry_run:
-        print(json.dumps({"dry_run": True, "validated": True,
-                          "summary": body.get("summary")}, ensure_ascii=False, indent=2))
-        return
+    if dry_run:
+        return {"dry_run": True, "validated": True, "summary": body.get("summary")}
 
     # gws prints a keyring notice to stderr; stdout is the created event JSON.
     out = proc.stdout
@@ -113,14 +178,113 @@ def main():
     except json.JSONDecodeError:
         created = {}
     when = created.get("start") or {}
-    print(json.dumps({
+    return {
         "created": True,
         "id": created.get("id"),
         "summary": created.get("summary") or body.get("summary"),
         "start": when.get("dateTime") or when.get("date"),
         "location": created.get("location") or body.get("location"),
         "htmlLink": created.get("htmlLink"),
-    }, ensure_ascii=False, indent=2))
+    }
+
+
+def write_one(calendar_id, body, dry_run):
+    """Returns (exit code, result object) for a single approved body."""
+    try:
+        found = existing_events(calendar_id, body)
+        if found:
+            return DUPLICATE, {
+                "error": "an event for this URL already exists; nothing written",
+                "duplicate": True, "summary": body.get("summary"), "matches": found}
+        return CREATED, insert(calendar_id, body, dry_run)
+    except WriteError as err:
+        return ERROR, {"error": str(err), "summary": body.get("summary")}
+
+
+STATUS = {CREATED: "created", DUPLICATE: "duplicate", ERROR: "error"}
+
+
+def run_single(args):
+    try:
+        body = load_single(args.input)
+        if len(args.approve_tokens) > 1:
+            raise WriteError("one body takes one --approve-token; use --input-dir "
+                             "for several events")
+        if args.approve_tokens and not matches(args.approve_tokens[0], body):
+            raise WriteError(
+                "approval token does not match this body -- it changed after it "
+                "was approved. Refusing to write. Re-run build_payload, show the "
+                "user the new payload, and get approval again.")
+    except WriteError as err:
+        die(str(err))
+    code, result = write_one(args.calendar_id, body, args.dry_run)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.exit(code)
+
+
+def run_batch(args):
+    try:
+        loaded = load_dir(args.input_dir)
+        bodies = [body for _, _, body in loaded]
+        approved = approved_indexes(args.approve_tokens, bodies)
+    except WriteError as err:
+        die(str(err))
+    if args.dry_run and not args.approve_tokens:
+        approved = set(range(len(bodies)))
+
+    results, codes = [], []
+    for i, (n, path, body) in enumerate(loaded):
+        head = {"n": n, "input": path}
+        if i not in approved:
+            results.append({**head, "status": "skipped",
+                            "summary": body.get("summary"),
+                            "reason": "no approval token for this payload"})
+            continue
+        code, result = write_one(args.calendar_id, body, args.dry_run)
+        codes.append(code)
+        status = "validated" if args.dry_run and code == CREATED else STATUS[code]
+        results.append({**head, "status": status, **result})
+
+    print(json.dumps({"results": results}, ensure_ascii=False, indent=2))
+    sys.exit(ERROR if ERROR in codes else DUPLICATE if DUPLICATE in codes else CREATED)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="create_event",
+        description="Insert build_payload bodies into the calendar (gated write).",
+    )
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument("--input", metavar="FILE",
+                        help="read one insert body from FILE instead of stdin")
+    source.add_argument("--input-dir", metavar="DIR",
+                        help="batch mode: read every pay_N.json in DIR; only bodies "
+                             "an --approve-token matches are written")
+    ap.add_argument("--calendar-id", required=True,
+                    help="target calendar (required, e.g. from `gws calendar calendarList list`)")
+    ap.add_argument("--approve-token", metavar="TOKEN", dest="approve_tokens",
+                    action="append", default=[],
+                    help="the approval token build_payload printed to stderr for "
+                         "an exact body; required for a real write, so the "
+                         "approved payload is provably the written one. Repeat "
+                         "once per approved event with --input-dir")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="validate without writing (no token needed; any token "
+                         "given must still match)")
+    args = ap.parse_args()
+
+    if not args.dry_run and not args.approve_tokens:
+        # Deliberately does not print the correct token: echoing it here
+        # would turn a missing-token error into an oracle, and any caller
+        # could mint approval for a body nobody looked at.
+        die("refusing to write without --approve-token: re-run build_payload "
+            "to get the token for this body, show the user the payload, and "
+            "pass the token once they approve it")
+
+    if args.input_dir:
+        run_batch(args)
+    else:
+        run_single(args)
 
 
 if __name__ == "__main__":

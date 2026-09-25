@@ -2,12 +2,21 @@
 """Turn a normalized event object (from a fetcher) into a Google Calendar
 insert body, applying the PARTYPLANNER rules as a single source of truth.
 
-  fetch_event <URL> --json | build_payload --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles
+  build_payload --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles < event.json
   build_payload --input event.json --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles
   build_payload --location "123 Main St" --fallback-location "San Francisco, CA" --default-tz America/Los_Angeles < event.json
 
 Reads the normalized JSON on stdin (or --input FILE), writes the JSON body for
 `gws calendar events insert --json` to stdout.
+
+Batch mode (--input-dir DIR) builds every ev_N.json in DIR into DIR/pay_N.json
+and prints a JSON report -- one entry per N with the finalized title, start,
+end, location and url, ready to show the user. Per-event overrides come from
+--manifest FILE, a JSON object keyed by N, so no summary is ever shell-quoted:
+
+  {"1": {"description": "...", "location": "...", "end_date": "9pm"}, "3": {...}}
+
+One event failing does not stop the rest; exit 1 if any failed.
 
 Rules encoded here (so the LLM never hand-assembles them):
   * summary     = "<title>"                    (whitespace-collapsed)
@@ -24,8 +33,9 @@ Remote-authored fields (title/description/location/url) are re-sanitized here,
 so a hand-built event object (the WebFetch fallback path) gets the same
 treatment as one that came from `fetch_event`.
 
-An approval token -- sha256 over the canonical payload -- goes to **stderr**,
-never into the payload file. `create_event` requires it, so the body the user
+An approval token -- sha256 over the canonical payload -- goes to **stderr**
+(batch: one `[N] approval-token` line per built event), never into the payload
+file. `create_event` requires it, so the body the user
 approved is provably the body that gets written.
 
 Requires: python3 (3.11+), stdlib only.
@@ -53,6 +63,14 @@ SENTINELS = {
 }
 
 
+EVENT_NAME_RE = re.compile(r"^ev_(\d+)\.json$")
+OVERRIDE_FIELDS = ("description", "location", "end_date")
+
+
+class BuildError(ValueError):
+    pass
+
+
 def die(msg):
     sys.exit("build_payload: " + msg)
 
@@ -73,11 +91,11 @@ def resolve_tz(event, default_tz):
 
 def parse_start(raw, tz_name):
     if not isinstance(raw, str) or not raw.strip():
-        die("event has no start time; cannot build an event body")
+        raise BuildError("event has no start time; cannot build an event body")
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
-        die("could not parse start time: %r" % raw)
+        raise BuildError("could not parse start time: %r" % raw)
     if dt.tzinfo is None:  # fetchers emit offset-aware ISO, but be safe
         dt = dt.replace(tzinfo=ZoneInfo(tz_name))
     return dt
@@ -101,7 +119,7 @@ def parse_end_override(raw, start, tz_name):
             continue
         end = datetime.combine(start.date(), t, tzinfo=ZoneInfo(tz_name))
         return end + timedelta(days=1) if end <= start else end
-    die("could not parse --end-date: %r" % raw)
+    raise BuildError("could not parse end date (--end-date / manifest end_date): %r" % raw)
 
 
 def resolve_end(event, start, duration_hours, tz_name, override):
@@ -113,7 +131,7 @@ def resolve_end(event, start, duration_hours, tz_name, override):
                 dt = dt.replace(tzinfo=ZoneInfo(tz_name))
             return dt
         except ValueError:
-            die("could not parse end time: %r" % raw)
+            raise BuildError("could not parse end time: %r" % raw)
     if override and override.strip():
         return parse_end_override(override, start, tz_name)
     return start + timedelta(hours=duration_hours)
@@ -135,13 +153,176 @@ def resolve_location(event, provided, fallback):
     return fallback
 
 
+def parse_event(raw, source):
+    if not raw.strip():
+        raise BuildError("no input in %s (expected normalized event JSON)" % source)
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise BuildError("%s is not valid JSON: %s" % (source, err))
+    if not isinstance(event, dict):
+        raise BuildError("%s must hold a JSON object" % source)
+    return event
+
+
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as err:
+        raise BuildError("could not read %s: %s" % (path, err))
+
+
+def build(event, overrides, args):
+    """The insert body for one normalized event. `overrides` holds the
+    agent's per-event judgment calls: description, location, end_date."""
+    # Re-scrub here, not only in fetch_event: this is the last point before the
+    # text becomes a calendar entry, and a hand-built event (WebFetch fallback)
+    # never passed through fetch_event at all.
+    event = sanitize(event)
+
+    # Clean here as well as in the extractors: a hand-built event can carry a
+    # dirty URL, and this is the spelling that lands in the description. Since
+    # check_dup searches for the cleaned form, storing anything else would make
+    # a future duplicate check miss this event and file a second copy.
+    url = (event.get("url") or "").strip()
+    if not url:
+        raise BuildError("event has no usable http(s) url; the URL is required and must "
+                         "lead the description (a non-http scheme is rejected outright)")
+    url = clean_url(url)
+
+    summary = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
+
+    override_desc = overrides.get("description")
+    body_desc = override_desc if override_desc is not None else (event.get("description") or "")
+    body_desc = body_desc.strip()
+    description = url + ("\n\n" + body_desc if body_desc else "")
+
+    tz_name = resolve_tz(event, args.default_tz)
+    start = parse_start(event.get("start"), tz_name)
+    end = resolve_end(event, start, args.duration_hours, tz_name, overrides.get("end_date"))
+    if end <= start:
+        raise BuildError("end time is not after start time (start=%s end=%s)"
+                         % (start.isoformat(), end.isoformat()))
+
+    return {
+        "summary": summary,
+        "description": description,
+        "location": resolve_location(event, overrides.get("location"), args.fallback_location),
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
+    }
+
+
+def load_manifest(path, numbers):
+    """Per-event overrides keyed by N. Checked in full before anything is
+    built, so a typo in a key or field fails loudly instead of silently
+    dropping the agent's summary."""
+    if not path:
+        return {}
+    manifest = parse_event(read_file(path), path)
+    overrides = {}
+    for key, entry in manifest.items():
+        if not key.isdigit() or int(key) not in numbers:
+            raise BuildError("manifest key %r has no matching ev_%s.json" % (key, key))
+        if not isinstance(entry, dict):
+            raise BuildError("manifest entry %r must be a JSON object" % key)
+        unknown = set(entry) - set(OVERRIDE_FIELDS)
+        if unknown:
+            raise BuildError("manifest entry %r has unknown fields %s (allowed: %s)"
+                             % (key, sorted(unknown), ", ".join(OVERRIDE_FIELDS)))
+        if not all(isinstance(v, str) for v in entry.values()):
+            raise BuildError("manifest entry %r: every value must be a string" % key)
+        overrides[int(key)] = entry
+    return overrides
+
+
+def list_events(directory):
+    try:
+        names = os.listdir(directory)
+    except OSError as err:
+        raise BuildError("could not list %s: %s" % (directory, err))
+    numbered = sorted((int(m.group(1)), name) for name in names
+                      if (m := EVENT_NAME_RE.match(name)))
+    if not numbered:
+        raise BuildError("no ev_N.json files in %s" % directory)
+    return numbered
+
+
+def build_item(n, name, overrides, args):
+    head = {"n": n}
+    try:
+        event = parse_event(read_file(os.path.join(args.input_dir, name)), name)
+        payload = build(event, overrides, args)
+    except BuildError as err:
+        return {**head, "status": "error", "error": str(err)}, None
+    path = os.path.join(args.input_dir, "pay_%d.json" % n)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    return {**head, "status": "built", "file": path,
+            "title": payload["summary"],
+            "start": payload["start"]["dateTime"],
+            "end": payload["end"]["dateTime"],
+            "timeZone": payload["start"]["timeZone"],
+            "location": payload["location"],
+            "url": payload["description"].split("\n", 1)[0]}, token_for(payload)
+
+
+def run_batch(args):
+    try:
+        numbered = list_events(args.input_dir)
+        overrides = load_manifest(args.manifest, {n for n, _ in numbered})
+    except BuildError as err:
+        die(str(err))
+
+    results = []
+    for n, name in numbered:
+        result, token = build_item(n, name, overrides.get(n, {}), args)
+        results.append(result)
+        if token:
+            print("build_payload: [%d] approval-token %s" % (n, token), file=sys.stderr)
+    json.dump({"results": results}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    print("build_payload: show these events to the user; pass the token of each "
+          "one they approve to create_event as --approve-token.", file=sys.stderr)
+    if any(r["status"] == "error" for r in results):
+        sys.exit(1)
+
+
+def run_single(args):
+    try:
+        raw = read_file(args.input) if args.input else sys.stdin.read()
+        event = parse_event(raw, args.input or "stdin")
+        payload = build(event, {"description": args.description,
+                                "location": args.location,
+                                "end_date": args.end_date}, args)
+    except BuildError as err:
+        die(str(err))
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+    # stderr, so the token stays out of the payload file and reaches the agent
+    # (and therefore the user) over a channel an attacker on the filesystem
+    # cannot rewrite.
+    print("build_payload: approval-token %s" % token_for(payload), file=sys.stderr)
+    print("build_payload: show this payload to the user; on an explicit yes, pass "
+          "the token to create_event as --approve-token.", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="build_payload",
         description="Normalized event JSON -> Google Calendar insert body.",
     )
-    ap.add_argument("--input", metavar="FILE",
-                    help="read event JSON from FILE instead of stdin")
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument("--input", metavar="FILE",
+                        help="read event JSON from FILE instead of stdin")
+    source.add_argument("--input-dir", metavar="DIR",
+                        help="batch mode: build every ev_N.json in DIR into pay_N.json")
+    ap.add_argument("--manifest", metavar="FILE",
+                    help="batch mode: JSON object of per-event overrides keyed by N "
+                         "(fields: description, location, end_date)")
     ap.add_argument("--location", metavar="STRING",
                     help="fallback location, used only when the fetched address "
                          "is gated/coarse (location_available false); a real "
@@ -164,63 +345,16 @@ def main():
                     help="event length when no end time is published (default: %(default)s)")
     args = ap.parse_args()
 
-    try:
-        raw = open(args.input, encoding="utf-8").read() if args.input else sys.stdin.read()
-    except OSError as err:
-        die("could not read input: %s" % err)
-    if not raw.strip():
-        die("no input (expected normalized event JSON on stdin)")
-    try:
-        event = json.loads(raw)
-    except json.JSONDecodeError as err:
-        die("input is not valid JSON: %s" % err)
-    if not isinstance(event, dict):
-        die("input JSON must be an object")
-
-    # Re-scrub here, not only in fetch_event: this is the last point before the
-    # text becomes a calendar entry, and a hand-built event (WebFetch fallback)
-    # never passed through fetch_event at all.
-    event = sanitize(event)
-
-    # Clean here as well as in the extractors: a hand-built event can carry a
-    # dirty URL, and this is the spelling that lands in the description. Since
-    # check_dup searches for the cleaned form, storing anything else would make
-    # a future duplicate check miss this event and file a second copy.
-    url = (event.get("url") or "").strip()
-    if not url:
-        die("event has no usable http(s) url; the URL is required and must lead "
-            "the description (a non-http scheme is rejected outright)")
-    url = clean_url(url)
-
-    summary = re.sub(r"\s+", " ", (event.get("title") or "").strip()) or "Untitled event"
-
-    body_desc = args.description if args.description is not None else (event.get("description") or "")
-    body_desc = body_desc.strip()
-    description = url + ("\n\n" + body_desc if body_desc else "")
-
-    tz_name = resolve_tz(event, args.default_tz)
-    start = parse_start(event.get("start"), tz_name)
-    end = resolve_end(event, start, args.duration_hours, tz_name, args.end_date)
-    if end <= start:
-        die("end time is not after start time (start=%s end=%s)"
-            % (start.isoformat(), end.isoformat()))
-
-    payload = {
-        "summary": summary,
-        "description": description,
-        "location": resolve_location(event, args.location, args.fallback_location),
-        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
-        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
-    }
-    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
-    sys.stdout.write("\n")
-
-    # stderr, so the token stays out of the payload file and reaches the agent
-    # (and therefore the user) over a channel an attacker on the filesystem
-    # cannot rewrite.
-    print("build_payload: approval-token %s" % token_for(payload), file=sys.stderr)
-    print("build_payload: show this payload to the user; on an explicit yes, pass "
-          "the token to create_event as --approve-token.", file=sys.stderr)
+    if args.input_dir:
+        per_event = [f for f in ("location", "description", "end_date") if getattr(args, f) is not None]
+        if per_event:
+            ap.error("with --input-dir, put %s in --manifest instead"
+                     % ", ".join("--" + f.replace("_", "-") for f in per_event))
+        run_batch(args)
+    elif args.manifest:
+        ap.error("--manifest needs --input-dir")
+    else:
+        run_single(args)
 
 
 if __name__ == "__main__":

@@ -3,15 +3,24 @@
 
   check_dup --calendar-id primary https://lu.ma/3a3qsbxo
   check_dup --url https://partiful.com/e/abc --calendar-id primary
+  check_dup --calendar-id primary https://luma.com/a https://partiful.com/e/b
 
 The input URL is cleaned (tracking params stripped) first, so this can run
 before fetch on a raw pasted URL. Queries the calendar with the URL as a
-full-text search, then confirms each hit
-by matching the (normalized) URL inside the event's stored description -- the
-`q` search tokenizes loosely, so a server-side hit alone is not proof. Because
-PARTYPLANNER always writes the URL first in the description, a real duplicate
-always contains it verbatim. Matching is a plain substring check on the stored
-description, so it does not depend on any timezone -- no --timezone flag here.
+full-text search, then confirms each hit by the (normalized) URL the event's
+stored description leads with -- the `q` search tokenizes loosely, so a
+server-side hit alone is not proof. PARTYPLANNER always writes the URL first
+in the description, so a real duplicate always leads with it. The match does
+not depend on any timezone -- no --timezone flag here.
+
+Given two or more URLs, each is checked in parallel and numbered by its
+position (1, 2, 3...). The output becomes `{"results": [...]}`, one entry per
+URL, whose `status` is:
+  new        no event on the calendar links to it
+  duplicate  see `matches`
+  repeat     cleans to the same URL as an earlier item (see `same_as`); not
+             queried, and must not be created twice
+  error      see `error`
 
 By default the search is bounded to the past year (--time-min defaults to 365
 days ago). Use --all-time to search unbounded, or --time-min/--time-max with
@@ -20,8 +29,9 @@ RFC 3339 timestamps for a custom window.
 Output: a JSON report on stdout, always.
 Exit codes (so `check_dup <url> && create_event ...` reads naturally):
   0  no duplicate  -> safe to create
-  2  error (bad usage, gws failure, unparseable response)
-  3  duplicate found
+  2  error (bad usage, gws failure, unparseable response);
+     with several URLs, any one errored
+  3  duplicate found; with several URLs, any one is a duplicate or repeat
 
   1 is not used by this script. argparse itself exits 2 on bad usage, and an
   unhandled exception exits 1 -- so a bare 1 means the script crashed, not
@@ -33,14 +43,15 @@ Requires: python3 (3.11+, stdlib only) and the `gws` CLI on PATH.
 import argparse
 import json
 import os
-import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from clean_url import clean_url, leading_url, normalize_url  # noqa: E402
+from calendar_query import CalendarQueryError, default_time_min, find_url_matches  # noqa: E402
+from clean_url import clean_url, normalize_url  # noqa: E402
 
 NO_DUP, DUP_FOUND, ERROR = 0, 3, 2
+MAX_PARALLEL = 4
 
 
 def die(msg):
@@ -48,65 +59,50 @@ def die(msg):
     sys.exit(ERROR)
 
 
-def run_page(calendar_id, url, max_results, page_token, time_min=None, time_max=None):
-    params = {
-        "calendarId": calendar_id,
-        "q": url,
-        "maxResults": max_results,
-        "singleEvents": True,
-    }
-    if time_min:
-        params["timeMin"] = time_min
-    if time_max:
-        params["timeMax"] = time_max
-    if page_token:
-        params["pageToken"] = page_token
-    cmd = ["gws", "calendar", "events", "list", "--params", json.dumps(params)]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError:
-        die("`gws` not found on PATH")
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        die("gws query failed (exit %d): %s" % (proc.returncode, detail[:500]))
-
-    # gws prints a keyring notice to stderr; stdout is the raw Calendar API JSON.
-    # Decode from the first brace to tolerate any incidental prefix.
-    out = proc.stdout
-    brace = out.find("{")
-    if brace == -1:
-        die("gws returned no JSON object")
-    try:
-        return json.JSONDecoder().raw_decode(out, brace)[0]
-    except json.JSONDecodeError as err:
-        die("could not parse gws response: %s" % err)
-
-
-def run_query(calendar_id, url, max_results, max_pages, time_min=None, time_max=None):
-    """Walk every page of results rather than judging on the first.
-
-    `q` is a loose full-text search, so a busy calendar can push the real match
-    past a single page -- and a dedup check that stops early reports "new" for
-    an event that already exists. Returns (items, exhausted)."""
-    items, token = [], None
-    for _ in range(max_pages):
-        data = run_page(calendar_id, url, max_results, token, time_min, time_max)
-        items.extend(data.get("items") or [])
-        token = data.get("nextPageToken")
-        if not token:
-            return items, True
-    return items, False
-
-
-def summarize(item):
-    when = item.get("start") or {}
+def report_for(url, args, time_min, time_max):
+    matches, examined, exhausted = find_url_matches(
+        args.calendar_id, url, time_min, time_max, args.max_results, args.max_pages)
     return {
-        "id": item.get("id"),
-        "summary": item.get("summary"),
-        "start": when.get("dateTime") or when.get("date"),
-        "location": item.get("location"),
-        "htmlLink": item.get("htmlLink"),
+        "query_url": url,
+        "duplicate": bool(matches),
+        "count": len(matches),
+        "examined": examined,
+        "results_exhausted": exhausted,
+        "matches": matches,
     }
+
+
+def check_item(n, raw, args, time_min, time_max):
+    head = {"n": n, "input_url": raw}
+    try:
+        report = report_for(clean_url(raw), args, time_min, time_max)
+    except CalendarQueryError as err:
+        return {**head, "status": "error", "error": str(err)}
+    return {**head, "status": "duplicate" if report["duplicate"] else "new", **report}
+
+
+def run_batch(raws, args, time_min, time_max):
+    first_seen, repeats, to_query = {}, {}, []
+    for n, raw in enumerate(raws, start=1):
+        key = normalize_url(clean_url(raw))
+        if key in first_seen:
+            repeats[n] = {"n": n, "input_url": raw, "status": "repeat",
+                          "query_url": clean_url(raw), "same_as": first_seen[key]}
+        else:
+            first_seen[key] = n
+            to_query.append((n, raw))
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+        checked = pool.map(lambda item: check_item(*item, args, time_min, time_max), to_query)
+        by_n = {r["n"]: r for r in checked}
+    by_n.update(repeats)
+    results = [by_n[n] for n in sorted(by_n)]
+
+    json.dump({"results": results}, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+    statuses = {r["status"] for r in results}
+    sys.exit(ERROR if "error" in statuses
+             else DUP_FOUND if statuses & {"duplicate", "repeat"} else NO_DUP)
 
 
 def main():
@@ -114,7 +110,8 @@ def main():
         prog="check_dup",
         description="Detect a calendar event already linking to a URL.",
     )
-    ap.add_argument("url", nargs="?", help="event URL to check (clean/canonical)")
+    ap.add_argument("urls", nargs="*", metavar="url",
+                    help="event URL(s) to check; two or more switch to a batch report")
     ap.add_argument("--url", dest="url_opt", help="event URL (alternative to positional)")
     ap.add_argument("--calendar-id", required=True,
                     help="calendar to search (required, e.g. from `gws calendar calendarList list`)")
@@ -130,40 +127,27 @@ def main():
                     help="search all events, override the default 1-year window")
     args = ap.parse_args()
 
-    raw = args.url or args.url_opt
-    if not raw or not raw.strip():
+    raws = [u.strip() for u in args.urls + ([args.url_opt] if args.url_opt else [])]
+    if not raws or not all(raws):
         die("no URL given (pass it positionally or with --url)")
-    # Clean first so dedup can run before fetch, on a possibly-dirty pasted URL.
-    url = clean_url(raw.strip())
 
     if args.all_time:
         time_min, time_max = None, None
     else:
-        time_min = args.time_min or (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        time_min = args.time_min or default_time_min()
         time_max = args.time_max
 
-    items, exhausted = run_query(args.calendar_id, url, args.max_results, args.max_pages,
-                                 time_min, time_max)
+    if len(raws) > 1:
+        run_batch(raws, args, time_min, time_max)
 
-    # Positional, not a substring search: PARTYPLANNER writes the URL first, so
-    # a real duplicate leads with it. A loose `in` check also matched a URL that
-    # merely appeared somewhere in the body -- including inside another link's
-    # query string -- and reported a duplicate that was not one.
-    target = normalize_url(url)
-    matches = [summarize(it) for it in items
-               if target and leading_url(it.get("description") or "") == target]
-
-    report = {
-        "query_url": url,
-        "duplicate": bool(matches),
-        "count": len(matches),
-        "examined": len(items),
-        "results_exhausted": exhausted,
-        "matches": matches,
-    }
+    # Clean first so dedup can run before fetch, on a possibly-dirty pasted URL.
+    try:
+        report = report_for(clean_url(raws[0]), args, time_min, time_max)
+    except CalendarQueryError as err:
+        die(str(err))
     json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
-    sys.exit(DUP_FOUND if matches else NO_DUP)
+    sys.exit(DUP_FOUND if report["duplicate"] else NO_DUP)
 
 
 if __name__ == "__main__":
